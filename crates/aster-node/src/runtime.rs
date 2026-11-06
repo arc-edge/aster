@@ -18635,8 +18635,13 @@ async fn run_node_actor_inner(
                     if !event_contact_wake.considers(peer_id, contact_cause) {
                         continue;
                     }
-                    // A peer out of reach keeps its armed Event edge too.
-                    if contact_gate.as_ref().is_some_and(|gate| !gate.allows(&peer_id)) {
+                    // A peer out of reach keeps its armed Event edge too, and what its
+                    // last contact did says nothing about when it comes back.
+                    if contact_gate
+                        .as_ref()
+                        .is_some_and(|gate| !gate.allows(&peer_id))
+                    {
+                        unreachable_peers.remove(&peer_id);
                         continue;
                     }
                     // A deferred peer keeps its armed Event edge for a later tick.
