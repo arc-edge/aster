@@ -19281,11 +19281,15 @@ async fn run_node_actor_inner(
                         );
                     }
                     Some(Ok((task, (peer, Err(error))))) => {
-                        // With a gate the application says who is in reach, and a
-                        // contact that failed into a link just lost says nothing
-                        // about when that peer comes back.
-                        if matches!(error, NodeError::Carrier(_)) && contact_gate.is_none() {
-                            unreachable_peers.insert(peer.carrier());
+                        if matches!(error, NodeError::Carrier(_)) {
+                            // Launching took this peer's Event edge. With a gate the
+                            // application says who is in reach, so what this contact
+                            // carried stays due for when the peer comes back.
+                            if contact_gate.is_some() {
+                                event_contact_wake.arm_event([peer.carrier()]);
+                            } else {
+                                unreachable_peers.insert(peer.carrier());
+                            }
                         }
                         outbound_peers.remove(&peer.carrier());
                         outbound_abort_handles.remove(&peer.carrier());

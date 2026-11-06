@@ -29,9 +29,8 @@ Measured on one link between two nodes, with one 10-byte Event:
   still spends airtime, because the handshake is sent and retried until it times
   out. On a shared radio with ten nodes that cost more than everything else. An
   application that knows who it can hear keeps this current, and outbound contacts
-  go only to those peers. With a gate a failed contact doesn't mark a peer unreachable,
-  because the application already says who is in reach, so news goes as soon as a peer
-  returns.
+  go only to those peers. With a gate a contact that fails at the carrier keeps its news
+  armed and doesn't mark the peer unreachable, so news goes as soon as the peer returns.
 - `MutableSourceInterests::event_only`. Contacts end after Event transfer and
   skip the State, Record, Blob and Event-bridge lanes, which cost round trips on
   every contact even with nothing to move.
