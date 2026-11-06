@@ -72,17 +72,17 @@ use aster_redb_store::{
     BlobDepotLimits, BlobLeaseLimits, BlobLifecycleLimits, BlobMaintenanceBudget,
     BlobMaintenanceProgress, BlobSemanticId, BlobSourceProjection, BlobSourceRetention,
     BlobSourceStageOutcome, BlobStoreError, BlobTransferId, BlobVariantId, ControlOutcome,
-    ControlPolicySnapshot, ControlRejectionReason, ControlTransferId, CustodyObjectKey,
-    CustodyPeerApplyDisposition, CustodyPeerApplyEvidence, CustodyPeerSelectorRevision,
-    CustodyPolicyRevision, CustodyPressureDemand, CustodyQuota, CustodyReconciliationEvidence,
-    CustodyReconciliationSelection, CustodySendAuthorization, CustodySenderProjection,
-    CustodyStoreError, CustodyUsage, EventOperationAuditProgress, EventOperationAuditState,
-    EventOperationAuditStatus, EventOperationLimits, EventPageAttemptCursor,
-    EventPageAttemptCursorUpdate, EventPublicationIntent, EventPublicationSpec,
-    EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey, EventSubscriptionMode,
-    EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint, MAX_BLOB_NETWORK_RANGE_BYTES,
-    MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS, MAX_CUSTODY_PAGE,
-    MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
+    ControlPolicySnapshot, ControlRejectionReason, ControlTransferId, CustodyGcReport,
+    CustodyObjectKey, CustodyPeerApplyDisposition, CustodyPeerApplyEvidence,
+    CustodyPeerSelectorRevision, CustodyPolicyRevision, CustodyPressureDemand, CustodyQuota,
+    CustodyReconciliationEvidence, CustodyReconciliationSelection, CustodySendAuthorization,
+    CustodySenderProjection, CustodyStoreError, CustodyUsage, EventOperationAuditProgress,
+    EventOperationAuditState, EventOperationAuditStatus, EventOperationLimits,
+    EventPageAttemptCursor, EventPageAttemptCursorUpdate, EventPublicationIntent,
+    EventPublicationSpec, EventReplicationPolicySnapshot, EventSemanticId, EventSubscriptionKey,
+    EventSubscriptionMode, EventSubscriptionSpec, EventTransferId, LocalCustodyCheckpoint,
+    MAX_BLOB_NETWORK_RANGE_BYTES, MAX_BLOB_NETWORK_SOURCE_BYTES, MAX_BLOB_NETWORK_STAGING_ROWS,
+    MAX_CUSTODY_PAGE, MAX_CUSTODY_RETIREMENTS, MAX_EVENT_PAGE, MAX_MUTABLE_TRANSFER_CURSOR_PEERS,
     MAX_NETWORK_BLOB_BYTES, MAX_NETWORK_BLOB_CHUNKS, MAX_ROUTE_CACHE_ITEMS,
     MutableTransferCursorClass, MutableTransferCursorMode, NumberedEventOperationRequest,
     NumberedEventPublishOutcome, PendingBlobLifetimeTransition, PendingBlobSource,
@@ -2343,6 +2343,12 @@ fn parse_linux_boot_id(input: &[u8]) -> Option<[u8; 16]> {
 /// A continuity observation may itself revise durable custody policy. The
 /// whole pass therefore retries from a fresh revision instead of mixing
 /// plans from two continuity/config generations.
+///
+/// Marking a row advances the revision too. That is the pass's own work, so the
+/// next step carries on from the current revision. If it retried, rows that
+/// expire one after another would give every attempt a new row to mark and use
+/// up the retries. An `Ok` still means every step ran: contacts run this before
+/// they build a receiver baseline.
 pub(crate) fn drive_custody_maintenance(
     store: &Store,
     clock: &NodeCustodyClock,
@@ -2361,9 +2367,36 @@ pub(crate) fn drive_custody_maintenance_observed(
     clock: &NodeCustodyClock,
     scope_quotas: &[CustodyQuota],
 ) -> CustodyMaintenanceAttempt {
+    drive_custody_maintenance_sampled(store, || clock.sample(), scope_quotas)
+}
+
+/// Returns the revision the next step of a maintenance pass expects.
+///
+/// Every row a step marks advances the revision, so after marking the current
+/// revision is the pass's own. With nothing marked the expected revision stands,
+/// and a change by another writer fails the next step and retries the pass.
+fn custody_revision_after_step(
+    store: &Store,
+    expected: CustodyPolicyRevision,
+    report: &CustodyGcReport,
+) -> Result<CustodyPolicyRevision, StoreError> {
+    if report.marked.is_empty() {
+        Ok(expected)
+    } else {
+        store.custody_policy_revision()
+    }
+}
+
+/// Runs maintenance with each attempt's sample taken from `take_sample`, which
+/// runs after that attempt reads the policy revision and before its pass.
+fn drive_custody_maintenance_sampled(
+    store: &Store,
+    mut take_sample: impl FnMut() -> Result<CustodySample, NodeError>,
+    scope_quotas: &[CustodyQuota],
+) -> CustodyMaintenanceAttempt {
     let mut writer_commits = 0u64;
     for _ in 0..MAX_CUSTODY_MAINTENANCE_RETRIES {
-        let policy_revision = match store.custody_policy_revision() {
+        let mut policy_revision = match store.custody_policy_revision() {
             Ok(revision) => revision,
             Err(error) => {
                 return CustodyMaintenanceAttempt {
@@ -2372,7 +2405,7 @@ pub(crate) fn drive_custody_maintenance_observed(
                 };
             }
         };
-        let sample = match clock.sample() {
+        let sample = match take_sample() {
             Ok(sample) => sample,
             Err(error) => {
                 return CustodyMaintenanceAttempt {
@@ -2390,7 +2423,8 @@ pub(crate) fn drive_custody_maintenance_observed(
             writer_commits = writer_commits.checked_add(garbage.writer_commits()).ok_or(
                 StoreError::SemanticInvariant("custody maintenance writer count overflowed"),
             )?;
-            garbage.into_result()?;
+            policy_revision =
+                custody_revision_after_step(store, policy_revision, &garbage.into_result()?)?;
             let global = store.collect_custody_pressure_observed(
                 None,
                 CustodyPressureDemand {
@@ -2404,7 +2438,8 @@ pub(crate) fn drive_custody_maintenance_observed(
             writer_commits = writer_commits.checked_add(global.writer_commits()).ok_or(
                 StoreError::SemanticInvariant("custody maintenance writer count overflowed"),
             )?;
-            global.into_result()?;
+            policy_revision =
+                custody_revision_after_step(store, policy_revision, &global.into_result()?)?;
             for quota in scope_quotas {
                 let scoped = store.collect_custody_pressure_observed(
                     quota.scope(),
@@ -2419,7 +2454,8 @@ pub(crate) fn drive_custody_maintenance_observed(
                 writer_commits = writer_commits.checked_add(scoped.writer_commits()).ok_or(
                     StoreError::SemanticInvariant("custody maintenance writer count overflowed"),
                 )?;
-                scoped.into_result()?;
+                policy_revision =
+                    custody_revision_after_step(store, policy_revision, &scoped.into_result()?)?;
             }
             Ok(())
         })();
@@ -65107,6 +65143,154 @@ mod tests {
             drop(node.store);
             fs::remove_dir_all(node.state).expect("baseline cleanup");
         }
+    }
+
+    /// A store holding one finite Event per lifetime, all published at tick 0.
+    fn custody_maintenance_test_store(
+        label: &str,
+        seed: u8,
+        clock_id: [u8; 16],
+        ttls_ms: impl IntoIterator<Item = u64>,
+    ) -> (Store, PathBuf) {
+        let state = root(label);
+        fs::create_dir_all(&state).expect("maintenance state");
+        let services = control_test_services([seed; 32]);
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.other.mission_authority_id(),
+        )
+        .expect("maintenance store");
+        let mut verifier = open_test_sealer(&services.other);
+        for (row, ttl_ms) in ttls_ms.into_iter().enumerate() {
+            let operation = format!("maintenance/{row}");
+            publish_test_custody_event(
+                &store,
+                &mut verifier,
+                TestCustodyPublication {
+                    operation: operation.as_bytes(),
+                    topic: &services.topic,
+                    scope: &services.scope,
+                    priority: Priority::Routine,
+                    ttl_ms: Some(ttl_ms),
+                    sample: CustodySample {
+                        clock_id,
+                        tick_ms: 0,
+                    },
+                    payload: operation.as_bytes(),
+                    tombstone: false,
+                },
+            );
+        }
+        (store, state)
+    }
+
+    #[test]
+    fn custody_maintenance_finishes_while_rows_expire_one_after_another() {
+        let clock_id = [0x95; 16];
+        // Every sample finds the next row due, and there is one row more than
+        // retries, so a retry would always have a new row to mark.
+        let rows = u64::try_from(MAX_CUSTODY_MAINTENANCE_RETRIES).expect("retries") + 1;
+        let (store, state) = custody_maintenance_test_store(
+            "maintenance-own-marks",
+            0x94,
+            clock_id,
+            (0..rows).map(|row| 1_000 + row * 10),
+        );
+        let clock = NodeCustodyClock::injected(clock_id, 1_000, 10);
+        for remaining in (0..rows).rev() {
+            drive_custody_maintenance(&store, &clock, &[]).expect("maintenance finishes");
+            assert_eq!(
+                store.custody_usage(None).expect("usage").items,
+                remaining,
+                "one attempt takes one sample and retires one row"
+            );
+        }
+        drop(store);
+        fs::remove_dir_all(state).expect("maintenance cleanup");
+    }
+
+    #[test]
+    fn another_writers_policy_change_still_retries_custody_maintenance() {
+        let clock_id = [0x97; 16];
+        let (store, state) =
+            custody_maintenance_test_store("maintenance-other-writer", 0x96, clock_id, []);
+        let clock = NodeCustodyClock::injected(clock_id, 1_000, 0);
+        // A sample is taken between the revision read and the pass.
+        let change_policy = |items| {
+            store
+                .set_custody_quota(CustodyQuota::global(items, 1_000_000).expect("quota"))
+                .expect("another writer's change");
+        };
+
+        let mut attempts = 0u64;
+        let maintenance = drive_custody_maintenance_sampled(
+            &store,
+            || {
+                attempts += 1;
+                if attempts == 1 {
+                    change_policy(100);
+                }
+                clock.sample()
+            },
+            &[],
+        );
+        maintenance.result.expect("the retry finishes the pass");
+        assert_eq!(attempts, 2, "the change retries the pass");
+
+        let mut attempts = 0u64;
+        let maintenance = drive_custody_maintenance_sampled(
+            &store,
+            || {
+                attempts += 1;
+                change_policy(200 + attempts);
+                clock.sample()
+            },
+            &[],
+        );
+        assert!(
+            matches!(
+                &maintenance.result,
+                Err(NodeError::Protocol(message))
+                    if message == "custody maintenance policy changed 4 times"
+            ),
+            "a writer that never lets up still ends in an error: {:?}",
+            maintenance.result
+        );
+        assert_eq!(
+            attempts,
+            u64::try_from(MAX_CUSTODY_MAINTENANCE_RETRIES).expect("retries")
+        );
+        drop(store);
+        fs::remove_dir_all(state).expect("maintenance cleanup");
+    }
+
+    #[test]
+    fn a_maintenance_step_takes_the_current_revision_only_after_marking_rows() {
+        let (store, state) =
+            custody_maintenance_test_store("maintenance-next-revision", 0x98, [0x99; 16], []);
+        let expected = store.custody_policy_revision().expect("revision");
+        let current = store
+            .set_custody_quota(CustodyQuota::global(100, 1_000_000).expect("quota"))
+            .expect("another writer's change");
+        assert_ne!(current, expected);
+
+        let next = |report: &CustodyGcReport| {
+            custody_revision_after_step(&store, expected, report).expect("next revision")
+        };
+        assert_eq!(
+            next(&CustodyGcReport::default()),
+            expected,
+            "with nothing marked the change stays visible to the next step"
+        );
+        assert_eq!(
+            next(&CustodyGcReport {
+                marked: vec![CustodyObjectKey::event(EventTransferId::new([1; 32]))],
+                ..CustodyGcReport::default()
+            }),
+            current
+        );
+        drop(store);
+        fs::remove_dir_all(state).expect("maintenance cleanup");
     }
 
     #[tokio::test]

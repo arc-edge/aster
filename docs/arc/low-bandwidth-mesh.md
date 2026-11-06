@@ -4,10 +4,10 @@ This fork of [Aster](https://github.com/defenseunicorns/aster) carries the
 changes [arc-uas](https://github.com/arc-edge/arc-uas) needs to run a small
 shared ledger between drones over a shared radio, satcom or metered cellular.
 Each one is opt-in, so a node that uses none of them behaves as upstream does,
-except for three that reach every node: finite-TTL custody is on for any macOS node
-with a boot domain, a node whose endpoint stops fails instead of spinning, and a
-custody send charges a fixed second of age rather than 32 ms. All nodes of a mission
-must set the same options.
+except for four that reach every node: finite-TTL custody is on for any macOS node
+with a boot domain, a node whose endpoint stops fails instead of spinning, a custody
+send charges a fixed second of age rather than 32 ms, and a custody maintenance pass
+carries on past the rows it marks. All nodes of a mission must set the same options.
 
 Measured on one link between two nodes, with one 10-byte Event:
 
@@ -133,6 +133,16 @@ Measured on one link between two nodes, with one 10-byte Event:
   to live can't be sent, and one scheduled anyway aborts its contact, so keep
   `with_min_send_remaining` above that. This reaches every node, with no option to turn
   it off.
+- Custody maintenance past its own marks. Marking an expired row advances the custody
+  policy revision, and every step of a maintenance pass checks that revision, so a pass
+  that marked a row failed its own next step and started again. Rows that expire one
+  after another give each attempt a new row to mark, and the fourth failed attempt is an
+  error. That fails an application call, and from the scheduler tick it ends the node.
+  In a 10-drone emulation, 600 Events published over about 5 s took down two of eleven
+  nodes when they expired. A step that marks rows now hands the next step the current
+  revision. A change by another writer still retries the pass, and four in a row are
+  still an error, because a contact counts on `Ok` meaning the pass finished. This
+  reaches every node, with no option to turn it off.
 
 ## Keeping up with upstream
 
