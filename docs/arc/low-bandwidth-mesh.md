@@ -25,9 +25,6 @@ Measured on one link between two nodes, with one 10-byte Event:
   of a pair waits one tick more, so the two sides don't collide. Pacing also turns
   off path MTU discovery: its probes are the largest single cost of a connection
   this short, and each contact is a new connection.
-- `ContactExpedite`, through `with_contact_expedite`. An application asks for the
-  shorter `urgent` spacing when it publishes or receives something urgent. Asking on
-  receipt is what speeds an Event up at every hop.
 - `ContactGate`, through `with_contact_gate`. A contact with a peer out of range
   still spends airtime, because the handshake is sent and retried until it times
   out. On a shared radio with ten nodes that cost more than everything else. An

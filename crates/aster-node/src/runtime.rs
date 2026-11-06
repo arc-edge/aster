@@ -1680,7 +1680,6 @@ pub struct SelectedForwardingConfig {
     event_bridge: Option<SelectedEventBridgeConfig>,
     controlled_relay: Option<ControlledRelayRouting>,
     contact_pacing: Option<ContactPacing>,
-    contact_expedite: Option<ContactExpedite>,
     contact_gate: Option<ContactGate>,
     peer_fallbacks: BTreeMap<EndpointId, SocketAddr>,
     extra_bind: Option<ExtraBind>,
@@ -1690,13 +1689,10 @@ pub struct SelectedForwardingConfig {
 
 /// How often a node contacts one peer on a link where contacts are expensive.
 ///
-/// Keep the sync interval well below `urgent`: a deferred contact starts on the
+/// Keep the sync interval well below `news`: a deferred contact starts on the
 /// first tick after its wait ends.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ContactPacing {
-    /// Shortest time between contacts with a peer that may lack an Event, for a
-    /// while after a [`ContactExpedite`] request.
-    pub urgent: Duration,
     /// Shortest time between contacts while this node has an Event the peer
     /// may lack. The Event stays armed, so one contact carries all that arrived
     /// during the wait.
@@ -1712,52 +1708,12 @@ impl ContactPacing {
     /// would otherwise come due on the same tick and collide, spending a
     /// handshake for nothing, so the higher identity waits one tick longer and
     /// is normally beaten to it.
-    fn defers(
-        self,
-        has_news: bool,
-        expedited: bool,
-        lower_identity: bool,
-        tick: Duration,
-        quiet: Duration,
-    ) -> bool {
-        let wait = match (has_news, expedited) {
-            (false, _) => self.idle,
-            (true, false) => self.news,
-            (true, true) => self.urgent,
-        };
+    fn defers(self, has_news: bool, lower_identity: bool, tick: Duration, quiet: Duration) -> bool {
+        let wait = if has_news { self.news } else { self.idle };
         let stagger = if lower_identity { Duration::ZERO } else { tick };
         quiet < wait.saturating_add(stagger)
     }
 }
-
-/// Lets an application ask a paced node to move what it holds soon.
-///
-/// Aster has no view of what is worth hurrying, so the application decides: it
-/// asks on publishing something urgent and on receiving something urgent, which
-/// is what speeds an Event up at every hop rather than only the first. For
-/// [`ContactPacing::news`] after a request, peers with news wait only
-/// [`ContactPacing::urgent`].
-#[derive(Clone, Debug, Default)]
-pub struct ContactExpedite(Arc<AtomicBool>);
-
-impl ContactExpedite {
-    /// Asks for contacts at the urgent spacing.
-    pub fn request(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    fn take(&self) -> bool {
-        self.0.swap(false, Ordering::AcqRel)
-    }
-}
-
-impl PartialEq for ContactExpedite {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-impl Eq for ContactExpedite {}
 
 /// Tells a node which peers are worth contacting.
 ///
@@ -1827,7 +1783,6 @@ impl SelectedForwardingConfig {
             event_bridge: None,
             controlled_relay: None,
             contact_pacing: None,
-            contact_expedite: None,
             contact_gate: None,
             peer_fallbacks: BTreeMap::new(),
             extra_bind: None,
@@ -1843,12 +1798,6 @@ impl SelectedForwardingConfig {
     /// every sync tick starts a contact whether or not there is news.
     pub const fn with_contact_pacing(mut self, pacing: ContactPacing) -> Self {
         self.contact_pacing = Some(pacing);
-        self
-    }
-
-    /// Connects `expedite`, which an application keeps a clone of, to this node.
-    pub fn with_contact_expedite(mut self, expedite: ContactExpedite) -> Self {
-        self.contact_expedite = Some(expedite);
         self
     }
 
@@ -18022,9 +17971,7 @@ async fn run_node_actor_inner(
     let mut collision_aborted_outbound = BTreeSet::<TaskId>::new();
     let non_preferred_fallback_delay = non_preferred_contact_fallback_delay(config.sync_interval);
     let contact_pacing = forwarding.contact_pacing;
-    let contact_expedite = forwarding.contact_expedite.clone();
     let contact_gate = forwarding.contact_gate.clone();
-    let mut expedited_until = None::<Instant>;
     // Peers whose last outbound contact failed at the carrier. With pacing they
     // wait the idle period, so a node doesn't spend the link on a peer out of range.
     let mut unreachable_peers = BTreeSet::<EndpointId>::new();
@@ -18679,12 +18626,6 @@ async fn run_node_actor_inner(
                 let start = next_outbound_peer % peer_count;
                 next_outbound_peer = (start + 1) % peer_count;
                 let election_now = Instant::now();
-                if let (Some(pacing), Some(expedite)) = (contact_pacing, &contact_expedite)
-                    && expedite.take()
-                {
-                    expedited_until = election_now.checked_add(pacing.news);
-                }
-                let expedited = expedited_until.is_some_and(|until| election_now < until);
                 for offset in 0..peer_count {
                     if outbound.len() >= MAX_OUTBOUND_CONTACTS {
                         break;
@@ -18704,7 +18645,6 @@ async fn run_node_actor_inner(
                         && pacing.defers(
                             event_contact_wake.bypasses_fallback(peer_id)
                                 && !unreachable_peers.contains(&peer_id),
-                            expedited,
                             local_id < peer_id,
                             config.sync_interval,
                             election_now.saturating_duration_since(*last),
@@ -34838,24 +34778,19 @@ mod tests {
     }
 
     #[test]
-    fn contact_pacing_waits_for_urgent_news_then_news_then_the_idle_period() {
+    fn contact_pacing_waits_for_news_then_the_idle_period() {
         let pacing = ContactPacing {
-            urgent: Duration::from_secs(2),
             news: Duration::from_secs(5),
             idle: Duration::from_secs(30),
         };
         let tick = Duration::from_secs(1);
         let secs = Duration::from_secs;
-        // An expedited peer with news goes first.
-        assert!(pacing.defers(true, true, true, tick, secs(1)));
-        assert!(!pacing.defers(true, true, true, tick, secs(2)));
-        // Otherwise a contact starts once the news wait has passed.
-        assert!(pacing.defers(true, false, true, tick, secs(4)));
-        assert!(!pacing.defers(true, false, true, tick, secs(5)));
-        // With no news the link stays quiet for the long wait, expedited or not.
-        assert!(pacing.defers(false, false, true, tick, secs(29)));
-        assert!(pacing.defers(false, true, true, tick, secs(29)));
-        assert!(!pacing.defers(false, false, true, tick, secs(30)));
+        // A contact starts once the news wait has passed.
+        assert!(pacing.defers(true, true, tick, secs(4)));
+        assert!(!pacing.defers(true, true, tick, secs(5)));
+        // With no news the link stays quiet for the long wait.
+        assert!(pacing.defers(false, true, tick, secs(29)));
+        assert!(!pacing.defers(false, true, tick, secs(30)));
     }
 
     #[test]
@@ -34875,26 +34810,16 @@ mod tests {
     }
 
     #[test]
-    fn an_expedite_request_is_taken_once_and_its_clones_share_it() {
-        let expedite = ContactExpedite::default();
-        assert!(!expedite.take());
-        expedite.clone().request();
-        assert!(expedite.take());
-        assert!(!expedite.take());
-    }
-
-    #[test]
     fn the_higher_identity_of_a_pair_waits_one_tick_so_they_do_not_collide() {
         let pacing = ContactPacing {
-            urgent: Duration::from_secs(2),
             news: Duration::from_secs(5),
             idle: Duration::from_secs(30),
         };
         let tick = Duration::from_secs(1);
         let quiet = Duration::from_secs(5);
-        assert!(!pacing.defers(true, false, true, tick, quiet));
-        assert!(pacing.defers(true, false, false, tick, quiet));
-        assert!(!pacing.defers(true, false, false, tick, quiet + tick));
+        assert!(!pacing.defers(true, true, tick, quiet));
+        assert!(pacing.defers(true, false, tick, quiet));
+        assert!(!pacing.defers(true, false, tick, quiet + tick));
     }
 
     #[test]
