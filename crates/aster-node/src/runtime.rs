@@ -1088,6 +1088,7 @@ impl From<MissionNearbyPeer> for ConfiguredPeer {
             carrier: peer.carrier,
             mission: peer.mission,
             locator: PeerLocator::Nearby,
+            fallback: None,
         }
     }
 }
@@ -20686,16 +20687,16 @@ struct RuntimeLocalEventSendPlan {
     schedule_limits: EventPageScheduleLimits,
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the explicit authorization generations and budgets are independently validated inputs"
-)]
 /// Whether an Event with this much lifetime left should be scheduled. A durable
 /// Event has no limit.
 fn survives_contact(remaining_ms: Option<u64>, min_send_remaining: Duration) -> bool {
     remaining_ms.is_none_or(|remaining| u128::from(remaining) >= min_send_remaining.as_millis())
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the explicit authorization generations and budgets are independently validated inputs"
+)]
 fn build_runtime_local_event_send_plan(
     store: &Store,
     event_guard: &EventLaneGuard,

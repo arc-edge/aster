@@ -66,6 +66,8 @@ where
 fn config(bind: SocketAddr, connect_timeout: Duration) -> EndpointConfig {
     EndpointConfig {
         bind,
+        extra_bind: None,
+        fixed_mtu: false,
         connect_timeout,
         exchange_timeout: Duration::from_secs(60),
         max_exchange_bytes: 2 * 1024 * 1024,
