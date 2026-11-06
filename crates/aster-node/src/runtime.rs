@@ -18006,6 +18006,11 @@ async fn run_node_actor_inner(
     let non_preferred_fallback_delay = non_preferred_contact_fallback_delay(config.sync_interval);
     let contact_pacing = forwarding.contact_pacing;
     let contact_gate = forwarding.contact_gate.clone();
+    // Nothing records which peers had news due, so a paced node starts as if all of
+    // them did. Otherwise a backlog would wait the idle period after every restart.
+    if contact_pacing.is_some() {
+        event_contact_wake.arm_event(configured_peers.iter().map(|peer| peer.carrier));
+    }
     // Peers whose last outbound contact failed at the carrier. With pacing they
     // wait the idle period, so a node doesn't spend the link on a peer out of range.
     let mut unreachable_peers = BTreeSet::<EndpointId>::new();
@@ -39261,178 +39266,291 @@ mod tests {
         fs::remove_dir_all(state).expect("cleanup actor state");
     }
 
+    /// A paced actor with one peer, whose contacts a test ends by hand.
+    #[cfg(unix)]
+    struct PacedActor {
+        actor: JoinHandle<Result<NodeReceipt, NodeError>>,
+        peer: EndpointId,
+        state: PathBuf,
+        launches: mpsc::UnboundedReceiver<ActorOutboundContactObservation>,
+        contact_results: mpsc::UnboundedSender<NodeError>,
+        application: mpsc::Sender<SelectedApplicationCommand>,
+        _control: mpsc::Sender<SelectedControlCommand>,
+        shutdown: mpsc::Sender<()>,
+    }
+
+    #[cfg(unix)]
+    impl PacedActor {
+        /// Far longer than the news spacing and far shorter than a 60 s idle period.
+        const SOON: Duration = Duration::from_secs(5);
+
+        async fn start(label: &str, pacing: ContactPacing, gate: Option<ContactGate>) -> Self {
+            let state = root(label);
+            fs::create_dir_all(&state).expect("actor state");
+            let local_id = NodeIdentity::load_or_create(&state)
+                .expect("local carrier identity")
+                .id();
+            // The lower identity starts contacts, which keeps the fallback out of this.
+            let peer = (0..1_024)
+                .find_map(|_| {
+                    let candidate = aster_iroh::SecretKey::generate().public();
+                    (candidate > local_id).then_some(candidate)
+                })
+                .expect("generate a carrier identity above the local identity");
+            let mut missions = issue_missions(2);
+            let peer_mission = missions.pop().expect("peer mission");
+            let local_mission = missions.pop().expect("local mission");
+            let mut forwarding = SelectedForwardingConfig::default().with_contact_pacing(pacing);
+            if let Some(gate) = gate {
+                forwarding = forwarding.with_contact_gate(gate);
+            }
+
+            let (observations_sender, launches) = mpsc::unbounded_channel();
+            let (contact_results, contact_results_receiver) = mpsc::unbounded_channel();
+            let contact_hook = ActorOutboundContactTestHook {
+                observations: observations_sender,
+                results: Arc::new(tokio::sync::Mutex::new(contact_results_receiver)),
+            };
+            let (application, application_receiver) = mpsc::channel(APPLICATION_COMMAND_CAPACITY);
+            let (control, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
+            let (shutdown, shutdown_receiver) = mpsc::channel(1);
+            let (ready_sender, ready_receiver) = oneshot::channel();
+            let (before_loop_ready, before_loop_reached) = oneshot::channel();
+            let (before_loop_release, release_loop) = oneshot::channel();
+            let (zeroization_queued, _zeroization_observer) = oneshot::channel();
+            let mut actor = tokio::spawn(run_node_actor_inner(
+                NodeConfig {
+                    state: state.clone(),
+                    bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                    mission: local_mission.credentials,
+                    peers: vec![MissionExpectedPeer {
+                        carrier: ExpectedPeer {
+                            id: peer,
+                            address: SocketAddr::from(([127, 0, 0, 1], 9)),
+                        },
+                        mission: peer_mission.identity,
+                    }],
+                    mutable_interests: MutableSourceInterests::default(),
+                    sync_interval: Duration::from_millis(20),
+                    run_for: None,
+                    application: NodeApplication::Relay,
+                },
+                forwarding,
+                Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                NodeActorChannels {
+                    handle_sigint: false,
+                    application_receiver,
+                    application_admission: Arc::new(AtomicBool::new(true)),
+                    control_receiver,
+                    shutdown_receiver,
+                    ready: ready_sender,
+                    contact_activity: Arc::new(ContactActivityProbe::default()),
+                    test_control: Some(RunNodeActorTestControl {
+                        allow_legacy_publication_fixture: false,
+                        event_operation_audit: None,
+                        before_loop_ready,
+                        before_loop_release: release_loop,
+                        zeroization_queued,
+                        blob_worker_fatal_on_shutdown: false,
+                        blob_maintenance_gate: None,
+                        blob_final_read_gate: None,
+                        event_group_execution_gate: None,
+                        outbound_contact: Some(contact_hook),
+                        contact_lifecycle: None,
+                        initial_peer_contact_activity: Vec::new(),
+                    }),
+                },
+            ));
+            match timeout(Duration::from_secs(10), ready_receiver).await {
+                Ok(Ok(_)) => {}
+                _ => panic!("actor readiness failed: {:?}", (&mut actor).await),
+            }
+            timeout(Duration::from_secs(5), before_loop_reached)
+                .await
+                .expect("pre-loop gate deadline")
+                .expect("pre-loop gate");
+            before_loop_release.send(()).expect("release actor loop");
+            Self {
+                actor,
+                peer,
+                state,
+                launches,
+                contact_results,
+                application,
+                _control: control,
+                shutdown,
+            }
+        }
+
+        async fn launched(&mut self, within: Duration) -> bool {
+            let Ok(observed) = timeout(within, self.launches.recv()).await else {
+                return false;
+            };
+            assert!(matches!(
+                observed,
+                Some(ActorOutboundContactObservation::Launched { peer, .. }) if peer == self.peer
+            ));
+            true
+        }
+
+        fn fail_at_the_carrier(&self) {
+            self.fail(NodeError::Carrier(CarrierError::Transport(
+                "injected failure".into(),
+            )));
+        }
+
+        fn fail(&self, error: NodeError) {
+            self.contact_results.send(error).expect("fail contact");
+        }
+
+        async fn publish(&self) {
+            let (response, published) = oneshot::channel();
+            self.application
+                .send(SelectedApplicationCommand::Event(
+                    SelectedEventCommand::Publish {
+                        request: EventPublishRequest {
+                            operation_key: b"gated-news".to_vec(),
+                            predecessor: None,
+                            topic: Topic::new("opaque").expect("topic"),
+                            scope: Scope::new("test/runtime-contact").expect("scope"),
+                            priority: Priority::Routine,
+                            logical_key: b"news".to_vec(),
+                            payload: b"news".to_vec(),
+                            tombstone: false,
+                        },
+                        options: EventPublishOptions::durable(),
+                        response,
+                    },
+                ))
+                .await
+                .expect("queue publication");
+            timeout(Duration::from_secs(5), published)
+                .await
+                .expect("publication deadline")
+                .expect("publication response")
+                .expect("publication accepted");
+        }
+
+        async fn stop(self) {
+            self.shutdown
+                .send(())
+                .await
+                .expect("request actor shutdown");
+            timeout(Duration::from_secs(10), self.actor)
+                .await
+                .expect("actor shutdown deadline")
+                .expect("actor task")
+                .expect("clean actor shutdown");
+            fs::remove_dir_all(self.state).expect("cleanup actor state");
+        }
+    }
+
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_failed_contact_with_a_gate_rearms_only_the_news_it_took() {
-        let state = root("gated-failed-contact-rearm");
-        fs::create_dir_all(&state).expect("actor state");
-        let local_id = NodeIdentity::load_or_create(&state)
-            .expect("local carrier identity")
-            .id();
-        // The lower identity starts contacts, which keeps the fallback out of this.
-        let peer_id = (0..1_024)
-            .find_map(|_| {
-                let candidate = aster_iroh::SecretKey::generate().public();
-                (candidate > local_id).then_some(candidate)
-            })
-            .expect("generate a carrier identity above the local identity");
-        let mut missions = issue_missions(2);
-        let peer_mission = missions.pop().expect("peer mission");
-        let local_mission = missions.pop().expect("local mission");
+    async fn a_restart_counts_as_news_for_a_peer_in_reach() {
         let pacing = ContactPacing {
             news: Duration::from_millis(100),
             idle: Duration::from_secs(60),
         };
         let gate = ContactGate::default();
-        gate.set_reachable([peer_id]);
-        let forwarding = SelectedForwardingConfig::default()
-            .with_contact_pacing(pacing)
-            .with_contact_gate(gate);
+        let mut node = PacedActor::start("paced-restart", pacing, Some(gate.clone())).await;
 
-        let (observations_sender, mut observations) = mpsc::unbounded_channel();
-        let (contact_results, contact_results_receiver) = mpsc::unbounded_channel();
-        let contact_hook = ActorOutboundContactTestHook {
-            observations: observations_sender,
-            results: Arc::new(tokio::sync::Mutex::new(contact_results_receiver)),
-        };
-        let (application_sender, application_receiver) =
-            mpsc::channel(APPLICATION_COMMAND_CAPACITY);
-        let (_control_sender, control_receiver) = mpsc::channel(CONTROL_COMMAND_CAPACITY);
-        let (shutdown_sender, shutdown_receiver) = mpsc::channel(1);
-        let (ready_sender, ready_receiver) = oneshot::channel();
-        let (before_loop_ready, before_loop_reached) = oneshot::channel();
-        let (before_loop_release, release_loop) = oneshot::channel();
-        let (zeroization_queued, _zeroization_observer) = oneshot::channel();
-        let quiet_since = Instant::now()
-            .checked_sub(pacing.idle + Duration::from_secs(1))
-            .expect("old peer activity instant");
-        let mut actor = tokio::spawn(run_node_actor_inner(
-            NodeConfig {
-                state: state.clone(),
-                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
-                mission: local_mission.credentials,
-                peers: vec![MissionExpectedPeer {
-                    carrier: ExpectedPeer {
-                        id: peer_id,
-                        address: SocketAddr::from(([127, 0, 0, 1], 9)),
-                    },
-                    mission: peer_mission.identity,
-                }],
-                mutable_interests: MutableSourceInterests::default(),
-                sync_interval: Duration::from_millis(20),
-                run_for: None,
-                application: NodeApplication::Relay,
-            },
-            forwarding,
-            Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
-            NodeActorChannels {
-                handle_sigint: false,
-                application_receiver,
-                application_admission: Arc::new(AtomicBool::new(true)),
-                control_receiver,
-                shutdown_receiver,
-                ready: ready_sender,
-                contact_activity: Arc::new(ContactActivityProbe::default()),
-                test_control: Some(RunNodeActorTestControl {
-                    allow_legacy_publication_fixture: false,
-                    event_operation_audit: None,
-                    before_loop_ready,
-                    before_loop_release: release_loop,
-                    zeroization_queued,
-                    blob_worker_fatal_on_shutdown: false,
-                    blob_maintenance_gate: None,
-                    blob_final_read_gate: None,
-                    event_group_execution_gate: None,
-                    outbound_contact: Some(contact_hook),
-                    contact_lifecycle: None,
-                    initial_peer_contact_activity: vec![(peer_id, quiet_since)],
-                }),
-            },
-        ));
-        match timeout(Duration::from_secs(10), ready_receiver).await {
-            Ok(Ok(_)) => {}
-            _ => panic!("actor readiness failed: {:?}", (&mut actor).await),
-        }
-        timeout(Duration::from_secs(5), before_loop_reached)
-            .await
-            .expect("pre-loop gate deadline")
-            .expect("pre-loop gate");
-        before_loop_release.send(()).expect("release actor loop");
-        let carrier_failure =
-            || NodeError::Carrier(CarrierError::Transport("injected failure".into()));
-        let mut launches = 0;
-        let mut launched = async |observations: &mut mpsc::UnboundedReceiver<_>, within| {
-            let observed = timeout(within, observations.recv()).await.ok()?;
-            assert!(matches!(
-                observed,
-                Some(ActorOutboundContactObservation::Launched { peer, .. }) if peer == peer_id
-            ));
-            launches += 1;
-            Some(launches)
-        };
+        assert!(
+            !node.launched(pacing.news * 5).await,
+            "a peer out of reach is left alone"
+        );
+        gate.set_reachable([node.peer]);
+        assert!(
+            node.launched(PacedActor::SOON).await,
+            "a backlog goes at the news spacing, not the idle period"
+        );
 
-        // With no news a failed contact leaves the peer on the idle period.
-        launched(&mut observations, Duration::from_secs(5))
-            .await
-            .expect("the idle period has passed");
-        contact_results
-            .send(carrier_failure())
-            .expect("fail contact");
-        assert_eq!(
-            launched(&mut observations, pacing.news * 5).await,
-            None,
+        node.fail_at_the_carrier();
+        node.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_contact_with_a_gate_keeps_the_news_it_took() {
+        let pacing = ContactPacing {
+            news: Duration::from_millis(100),
+            idle: Duration::from_secs(60),
+        };
+        let gate = ContactGate::default();
+        let mut node = PacedActor::start("gated-keeps-news", pacing, Some(gate.clone())).await;
+        gate.set_reachable([node.peer]);
+
+        assert!(node.launched(PacedActor::SOON).await);
+        node.fail_at_the_carrier();
+        assert!(
+            node.launched(PacedActor::SOON).await,
+            "the news that contact took stays due"
+        );
+
+        // Any other failure spends it, and new news goes at the news spacing.
+        node.fail(NodeError::Protocol("injected failure".into()));
+        assert!(!node.launched(pacing.news * 5).await);
+        node.publish().await;
+        assert!(
+            node.launched(PacedActor::SOON).await,
+            "news starts a contact"
+        );
+        node.fail_at_the_carrier();
+        assert!(
+            node.launched(PacedActor::SOON).await,
+            "the news that contact took stays due"
+        );
+
+        node.fail_at_the_carrier();
+        node.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_contact_with_a_gate_and_no_news_waits_the_idle_period() {
+        let pacing = ContactPacing {
+            news: Duration::from_millis(100),
+            idle: Duration::from_secs(1),
+        };
+        let gate = ContactGate::default();
+        let mut node = PacedActor::start("gated-no-news", pacing, Some(gate.clone())).await;
+        gate.set_reachable([node.peer]);
+
+        // This spends what a restart counts as news.
+        assert!(node.launched(PacedActor::SOON).await);
+        node.fail(NodeError::Protocol("injected failure".into()));
+
+        assert!(
+            node.launched(PacedActor::SOON).await,
+            "the idle period has passed"
+        );
+        node.fail_at_the_carrier();
+        assert!(
+            !node.launched(pacing.news * 5).await,
             "a contact that carried no news is not retried at the news spacing"
         );
 
-        // News goes at once, and a contact that took it keeps it due.
-        let (response, published) = oneshot::channel();
-        application_sender
-            .send(SelectedApplicationCommand::Event(
-                SelectedEventCommand::Publish {
-                    request: EventPublishRequest {
-                        operation_key: b"gated-news".to_vec(),
-                        predecessor: None,
-                        topic: Topic::new("opaque").expect("topic"),
-                        scope: Scope::new("test/runtime-contact").expect("scope"),
-                        priority: Priority::Routine,
-                        logical_key: b"news".to_vec(),
-                        payload: b"news".to_vec(),
-                        tombstone: false,
-                    },
-                    options: EventPublishOptions::durable(),
-                    response,
-                },
-            ))
-            .await
-            .expect("queue publication");
-        timeout(Duration::from_secs(5), published)
-            .await
-            .expect("publication deadline")
-            .expect("publication response")
-            .expect("publication accepted");
-        launched(&mut observations, Duration::from_secs(5))
-            .await
-            .expect("news starts a contact");
-        contact_results
-            .send(carrier_failure())
-            .expect("fail contact");
-        launched(&mut observations, Duration::from_secs(5))
-            .await
-            .expect("the news that contact took stays due");
+        node.stop().await;
+    }
 
-        contact_results
-            .send(carrier_failure())
-            .expect("release the last contact");
-        shutdown_sender
-            .send(())
-            .await
-            .expect("request actor shutdown");
-        timeout(Duration::from_secs(10), actor)
-            .await
-            .expect("actor shutdown deadline")
-            .expect("actor task")
-            .expect("clean actor shutdown");
-        fs::remove_dir_all(state).expect("cleanup actor state");
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_failed_contact_without_a_gate_waits_the_idle_period_even_with_news() {
+        let pacing = ContactPacing {
+            news: Duration::from_millis(100),
+            idle: Duration::from_secs(60),
+        };
+        let mut node = PacedActor::start("ungated-failed-contact", pacing, None).await;
+
+        assert!(node.launched(PacedActor::SOON).await);
+        node.fail_at_the_carrier();
+        node.publish().await;
+        assert!(
+            !node.launched(pacing.news * 5).await,
+            "with no gate a peer that failed may be out of range"
+        );
+
+        node.stop().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -39493,21 +39611,8 @@ mod tests {
         )
         .await
         .expect("start node");
-        node.selected_events()
-            .publish(EventPublishRequest {
-                operation_key: b"handshake-news".to_vec(),
-                predecessor: None,
-                topic: Topic::new("opaque").expect("topic"),
-                scope: Scope::new("test/runtime-contact").expect("scope"),
-                priority: Priority::Routine,
-                logical_key: b"news".to_vec(),
-                payload: b"news".to_vec(),
-                tombstone: false,
-            })
-            .await
-            .expect("publish");
 
-        for contact in ["the news starts one", "the failed one gave the news back"] {
+        for contact in ["a restart starts one", "the failed one gave its news back"] {
             timeout(Duration::from_secs(5), contacts.recv())
                 .await
                 .expect(contact)
