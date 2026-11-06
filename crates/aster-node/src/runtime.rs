@@ -599,7 +599,11 @@ const DEMO_PING_LOGICAL_KEY: &[u8] = b"ping";
 const DEMO_PING_OPERATION: &[u8] = b"aster.sample.ping-pong.v1/ping";
 const DEMO_EVENT_SUBSCRIPTION_KEY: &[u8] = b"aster.sample.ping-pong.v1/receive";
 const MAX_EVENT_PUBLISH_RETRIES: usize = 4;
-const MAX_CUSTODY_MAINTENANCE_RETRIES: usize = 4;
+/// One attempt for every pass that can run at once: one per contact slot and one on
+/// the actor. Another pass's mark costs a pass an attempt, and one tick can start many
+/// contacts together. A reboot's rows cost an attempt a page, and the default item
+/// limit is ten pages.
+const MAX_CUSTODY_MAINTENANCE_RETRIES: usize = MAX_INBOUND_CONTACTS + MAX_OUTBOUND_CONTACTS + 1;
 const CUSTODY_FINALIZATION_FIXED_MS: u64 = 1_000;
 const CUSTODY_FINALIZATION_BYTES_PER_MS: u64 = 1_024;
 /// Conservative authenticated age charged for the synchronous v3 send-finalization path.
@@ -2341,14 +2345,17 @@ fn parse_linux_boot_id(input: &[u8]) -> Option<[u8; 16]> {
 /// Runs one bounded expiry and quota-pressure maintenance pass.
 ///
 /// A continuity observation may itself revise durable custody policy. The
-/// whole pass therefore retries from a fresh revision instead of mixing
-/// plans from two continuity/config generations.
+/// whole pass therefore retries from a fresh revision.
 ///
 /// Marking a row advances the revision too. That is the pass's own work, so the
 /// next step carries on from the current revision. If it retried, rows that
-/// expire one after another would give every attempt a new row to mark and use
-/// up the retries. An `Ok` still means every step ran: contacts run this before
-/// they build a receiver baseline.
+/// expire one after another would give every attempt a new row to mark.
+///
+/// A row newly losing continuity advances the revision without being marked, so
+/// the pass retries and takes the next page of a reboot's rows. Contacts run this
+/// before they build a receiver baseline, which fences only rows already re-anchored.
+/// An `Ok` means every step ran, and after a step that marked rows the next pass
+/// takes any that are left.
 pub(crate) fn drive_custody_maintenance(
     store: &Store,
     clock: &NodeCustodyClock,
@@ -2372,9 +2379,11 @@ pub(crate) fn drive_custody_maintenance_observed(
 
 /// Returns the revision the next step of a maintenance pass expects.
 ///
-/// Every row a step marks advances the revision, so after marking the current
-/// revision is the pass's own. With nothing marked the expected revision stands,
-/// and a change by another writer fails the next step and retries the pass.
+/// Every row a step marks advances the revision, so after marking the pass takes the
+/// current revision, along with anything else that landed by then. That is safe
+/// because each step reads quota and continuity in its own write transaction. With
+/// nothing marked the expected revision stands, so a change by another writer or a
+/// row newly losing continuity fails the next step and retries the pass.
 fn custody_revision_after_step(
     store: &Store,
     expected: CustodyPolicyRevision,
@@ -65145,12 +65154,11 @@ mod tests {
         }
     }
 
-    /// A store holding one finite Event per lifetime, all published at tick 0.
+    /// A store holding one finite Event per clock and lifetime, all published at tick 0.
     fn custody_maintenance_test_store(
         label: &str,
         seed: u8,
-        clock_id: [u8; 16],
-        ttls_ms: impl IntoIterator<Item = u64>,
+        rows: impl IntoIterator<Item = ([u8; 16], u64)>,
     ) -> (Store, PathBuf) {
         let state = root(label);
         fs::create_dir_all(&state).expect("maintenance state");
@@ -65161,7 +65169,7 @@ mod tests {
         )
         .expect("maintenance store");
         let mut verifier = open_test_sealer(&services.other);
-        for (row, ttl_ms) in ttls_ms.into_iter().enumerate() {
+        for (row, (clock_id, ttl_ms)) in rows.into_iter().enumerate() {
             let operation = format!("maintenance/{row}");
             publish_test_custody_event(
                 &store,
@@ -65193,8 +65201,7 @@ mod tests {
         let (store, state) = custody_maintenance_test_store(
             "maintenance-own-marks",
             0x94,
-            clock_id,
-            (0..rows).map(|row| 1_000 + row * 10),
+            (0..rows).map(|row| (clock_id, 1_000 + row * 10)),
         );
         let clock = NodeCustodyClock::injected(clock_id, 1_000, 10);
         for remaining in (0..rows).rev() {
@@ -65212,8 +65219,7 @@ mod tests {
     #[test]
     fn another_writers_policy_change_still_retries_custody_maintenance() {
         let clock_id = [0x97; 16];
-        let (store, state) =
-            custody_maintenance_test_store("maintenance-other-writer", 0x96, clock_id, []);
+        let (store, state) = custody_maintenance_test_store("maintenance-other-writer", 0x96, []);
         let clock = NodeCustodyClock::injected(clock_id, 1_000, 0);
         // A sample is taken between the revision read and the pass.
         let change_policy = |items| {
@@ -65250,8 +65256,9 @@ mod tests {
         assert!(
             matches!(
                 &maintenance.result,
-                Err(NodeError::Protocol(message))
-                    if message == "custody maintenance policy changed 4 times"
+                Err(NodeError::Protocol(message)) if message == &format!(
+                    "custody maintenance policy changed {MAX_CUSTODY_MAINTENANCE_RETRIES} times"
+                )
             ),
             "a writer that never lets up still ends in an error: {:?}",
             maintenance.result
@@ -65265,9 +65272,73 @@ mod tests {
     }
 
     #[test]
+    fn custody_maintenance_outlasts_the_passes_running_beside_it() {
+        let clock_id = [0x9b; 16];
+        // The actor's pass is the one under test, with every contact slot beside it.
+        let rivals = u64::try_from(MAX_INBOUND_CONTACTS + MAX_OUTBOUND_CONTACTS).expect("slots");
+        let (store, state) = custody_maintenance_test_store(
+            "maintenance-rivals",
+            0x9a,
+            (0..rivals).map(|row| (clock_id, 1_000 + row * 10)),
+        );
+        let rival_clock = NodeCustodyClock::injected(clock_id, 1_000, 10);
+        let clock = NodeCustodyClock::injected(clock_id, 1_000, 0);
+
+        // A sample is taken between the revision read and the pass, which is where
+        // another pass's mark costs this one an attempt.
+        let mut attempts = 0u64;
+        let maintenance = drive_custody_maintenance_sampled(
+            &store,
+            || {
+                attempts += 1;
+                if attempts <= rivals {
+                    drive_custody_maintenance(&store, &rival_clock, &[]).expect("rival pass");
+                }
+                clock.sample()
+            },
+            &[],
+        );
+        maintenance.result.expect("the pass finishes");
+        assert_eq!(attempts, rivals + 1, "every rival cost one attempt");
+        assert_eq!(store.custody_usage(None).expect("usage").items, 0);
+        drop(store);
+        fs::remove_dir_all(state).expect("maintenance cleanup");
+    }
+
+    #[test]
+    fn a_row_losing_continuity_costs_custody_maintenance_an_attempt() {
+        let (earlier_boot, clock_id) = ([0x9d; 16], [0x9e; 16]);
+        // The second row's clock is already current, so the pass finds the first row
+        // the way it finds a reboot's later pages: losing continuity, with no clock
+        // change of its own to retry on.
+        let (store, state) = custody_maintenance_test_store(
+            "maintenance-lost-continuity",
+            0x9c,
+            [(earlier_boot, 1_000_000), (clock_id, 1_000_000)],
+        );
+        let clock = NodeCustodyClock::injected(clock_id, 10, 0);
+
+        let mut attempts = 0u64;
+        let maintenance = drive_custody_maintenance_sampled(
+            &store,
+            || {
+                attempts += 1;
+                clock.sample()
+            },
+            &[],
+        );
+        maintenance.result.expect("the retry finishes the pass");
+        assert_eq!(
+            attempts, 2,
+            "nothing was marked, so the revision moved under the pass"
+        );
+        drop(store);
+        fs::remove_dir_all(state).expect("maintenance cleanup");
+    }
+
+    #[test]
     fn a_maintenance_step_takes_the_current_revision_only_after_marking_rows() {
-        let (store, state) =
-            custody_maintenance_test_store("maintenance-next-revision", 0x98, [0x99; 16], []);
+        let (store, state) = custody_maintenance_test_store("maintenance-next-revision", 0x98, []);
         let expected = store.custody_policy_revision().expect("revision");
         let current = store
             .set_custody_quota(CustodyQuota::global(100, 1_000_000).expect("quota"))

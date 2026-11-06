@@ -138,13 +138,18 @@ Measured on one link between two nodes, with one 10-byte Event:
 - Custody maintenance past its own marks. Marking an expired row advances the custody
   policy revision, and every step of a maintenance pass checks that revision, so a pass
   that marked a row failed its own next step and started again. Rows that expire one
-  after another give each attempt a new row to mark, and the fourth failed attempt is an
+  after another give each attempt a new row to mark, and the fourth failed attempt was an
   error. That fails an application call, and from the scheduler tick it ends the node.
   In a 10-drone emulation, 600 Events published over about 5 s took down two of eleven
   nodes when they expired. A step that marks rows now hands the next step the current
-  revision. A change by another writer still retries the pass, and four in a row are
-  still an error, because a contact counts on `Ok` meaning the pass finished. This
-  reaches every node, with no option to turn it off.
+  revision, which takes in anything else that landed by then. Otherwise a change by
+  another writer still retries the pass, and so does a row newly losing continuity,
+  which is how one pass re-anchors a reboot's rows a page at a time. Passes that run at
+  once also cost each other attempts, and one tick can start many contacts together, so
+  four attempts could still run out with four or more passes beside one. A pass now gets
+  33, one per contact slot and one for the actor, and the 33rd failed attempt is still
+  an error, because a contact counts on `Ok` meaning every step ran. This reaches every
+  node, with no option to turn it off.
 
 ## Keeping up with upstream
 
