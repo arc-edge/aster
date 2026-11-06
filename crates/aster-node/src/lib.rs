@@ -84,7 +84,7 @@ pub use mission::{
     respond_classical_over_iroh,
 };
 pub use runtime::{
-    ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
+    ContactPacing, ControlPublicationReceipt, DemoScenario, EventEmissionPolicy,
     MAX_CUSTODY_FINALIZATION_CHARGE_MS, MissionExpectedPeer, MutableSourceInterests,
     NodeApplication, NodeBootstrapError, NodeBootstrapErrorKind, NodeConfig, NodeConfigOptions,
     NodeError, NodeOperatorOutputPolicy, NodeReceipt, PeerReceipt, RunningNode,

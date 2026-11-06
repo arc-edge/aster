@@ -10,7 +10,7 @@ use std::{
     collections::{BTreeSet, VecDeque},
     error::Error,
     fmt,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     str::FromStr,
     sync::{Arc, Mutex},
     time::Duration,
@@ -19,10 +19,7 @@ use std::{
 #[cfg(feature = "nearby-discovery")]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "nearby-discovery")]
-use std::{
-    collections::BTreeMap,
-    net::{IpAddr, Ipv4Addr},
-};
+use std::{collections::BTreeMap, net::Ipv4Addr};
 
 use futures::StreamExt;
 #[cfg(feature = "nearby-discovery")]
@@ -557,11 +554,50 @@ impl FromStr for ExpectedPeer {
     }
 }
 
+/// A second network for an endpoint on two networks.
+///
+/// Iroh offers every address an endpoint is bound to, and on each new connection
+/// probes those addresses and may move traffic to them, and that can't be turned
+/// off. A wildcard bind therefore offers every interface the host has, and even
+/// two exact binds on one Iroh endpoint would probe the second network on every
+/// contact. Where that network is metered, that is unwanted traffic the whole
+/// time the first one works.
+///
+/// So this network gets its own Iroh endpoint with the same identity. A
+/// connection on one endpoint can't see the other's socket, and traffic reaches
+/// this network only when a peer's address is in its subnet.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExtraBind {
+    /// Exact local address. A failed bind is not fatal, so an endpoint still
+    /// starts while this network is down.
+    pub address: SocketAddr,
+    /// Length of this network's subnet. Peers in it are reached from here.
+    pub prefix_len: u8,
+}
+
+impl ExtraBind {
+    fn serves(&self, peer: IpAddr) -> bool {
+        match (self.address.ip(), peer) {
+            (IpAddr::V4(local), IpAddr::V4(peer)) => {
+                let shift = 32u32.saturating_sub(u32::from(self.prefix_len));
+                local.to_bits().checked_shr(shift) == peer.to_bits().checked_shr(shift)
+            }
+            (IpAddr::V6(local), IpAddr::V6(peer)) => {
+                let shift = 128u32.saturating_sub(u32::from(self.prefix_len));
+                local.to_bits().checked_shr(shift) == peer.to_bits().checked_shr(shift)
+            }
+            _ => false,
+        }
+    }
+}
+
 /// Bounded endpoint configuration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct EndpointConfig {
     /// Socket on which the endpoint listens.
     pub bind: SocketAddr,
+    /// Optional socket on a second network.
+    pub extra_bind: Option<ExtraBind>,
     /// Bound for establishing or accepting an authenticated connection.
     pub connect_timeout: Duration,
     /// Bound for one opaque request/response exchange.
@@ -575,6 +611,7 @@ impl EndpointConfig {
     pub fn direct(bind: SocketAddr) -> Self {
         Self {
             bind,
+            extra_bind: None,
             connect_timeout: Duration::from_secs(10),
             exchange_timeout: Duration::from_secs(10),
             max_exchange_bytes: DEFAULT_MAX_EXCHANGE_BYTES,
@@ -629,11 +666,19 @@ impl Error for CarrierError {}
 #[derive(Clone)]
 pub struct Endpoint {
     inner: IrohEndpoint,
+    extra: Option<ExtraEndpoint>,
     config: EndpointConfig,
     relay_url: Option<RelayUrl>,
     security_profile: CarrierSecurityProfile,
     #[cfg(feature = "nearby-discovery")]
     nearby_discovery_occupied: Arc<AtomicBool>,
+}
+
+/// The Iroh endpoint for an [`ExtraBind`] network.
+#[derive(Clone, Debug)]
+struct ExtraEndpoint {
+    inner: IrohEndpoint,
+    bind: ExtraBind,
 }
 
 #[derive(Clone)]
@@ -689,7 +734,7 @@ impl InboundAcceptor {
                         return result;
                     }
                 }
-                incoming = timeout(accept_timeout, endpoint.inner.accept()) => {
+                incoming = timeout(accept_timeout, endpoint.next_incoming()) => {
                     let incoming = incoming
                         .map_err(|_| CarrierError::Timeout("accept"))?
                         .ok_or_else(|| CarrierError::Transport("endpoint stopped accepting".into()))?;
@@ -1419,26 +1464,29 @@ impl Endpoint {
         let relay_mode = relay.as_ref().map_or(RelayMode::Disabled, |relay| {
             RelayMode::Custom(IrohRelayConfig::new(relay.url.clone(), None).into())
         });
-        let mut net_report_config = NetReportConfig::minimal();
-        // With QUIC address discovery disabled on the exact relay config,
-        // this bounded HTTPS probe is what lets Iroh select that relay.
-        net_report_config.https_probes = relay.is_some();
-        let mut builder = IrohEndpoint::builder(presets::Minimal)
-            .dns_resolver(
-                iroh::dns::DnsResolver::builder()
-                    .with_system_defaults()
-                    .disable_fallback()
-                    .build(),
-            )
-            .secret_key(secret)
-            .clear_address_lookup()
-            .clear_relay_transports()
-            .relay_mode(relay_mode)
-            .portmapper_config(PortmapperConfig::Disabled)
-            .net_report_config(net_report_config)
-            .transport_config(transport)
-            .clear_ip_transports()
-            .alpns(vec![security_profile.alpn().to_vec()]);
+        let endpoint_builder = |relay_mode: RelayMode| {
+            let mut net_report_config = NetReportConfig::minimal();
+            // With QUIC address discovery disabled on the exact relay config,
+            // this bounded HTTPS probe is what lets Iroh select that relay.
+            net_report_config.https_probes = relay.is_some();
+            IrohEndpoint::builder(presets::Minimal)
+                .dns_resolver(
+                    iroh::dns::DnsResolver::builder()
+                        .with_system_defaults()
+                        .disable_fallback()
+                        .build(),
+                )
+                .secret_key(secret.clone())
+                .clear_address_lookup()
+                .clear_relay_transports()
+                .relay_mode(relay_mode)
+                .portmapper_config(PortmapperConfig::Disabled)
+                .net_report_config(net_report_config)
+                .transport_config(transport.clone())
+                .clear_ip_transports()
+                .alpns(vec![security_profile.alpn().to_vec()])
+        };
+        let mut builder = endpoint_builder(relay_mode);
         if !relay_only {
             builder = builder
                 .bind_addr(config.bind)
@@ -1455,8 +1503,20 @@ impl Endpoint {
             .bind()
             .await
             .map_err(|error| CarrierError::Transport(error.to_string()))?;
+        let mut extra = None;
+        if let Some(bind) = config.extra_bind {
+            let builder = endpoint_builder(RelayMode::Disabled)
+                .bind_addr(bind.address)
+                .map_err(|error| CarrierError::Configuration(error.to_string()))?;
+            extra = builder
+                .bind()
+                .await
+                .ok()
+                .map(|inner| ExtraEndpoint { inner, bind });
+        }
         Ok(Self {
             inner,
+            extra,
             config,
             relay_url: relay.map(|relay| relay.url),
             security_profile,
@@ -1477,7 +1537,30 @@ impl Endpoint {
 
     /// Returns the actual local sockets after binding.
     pub fn bound_sockets(&self) -> Vec<SocketAddr> {
-        self.inner.bound_sockets()
+        let mut sockets = self.inner.bound_sockets();
+        if let Some(extra) = &self.extra {
+            sockets.extend(extra.inner.bound_sockets());
+        }
+        sockets
+    }
+
+    /// The next inbound connection on either network.
+    async fn next_incoming(&self) -> Option<iroh::endpoint::Incoming> {
+        match &self.extra {
+            Some(extra) => tokio::select! {
+                incoming = self.inner.accept() => incoming,
+                incoming = extra.inner.accept() => incoming,
+            },
+            None => self.inner.accept().await,
+        }
+    }
+
+    /// The Iroh endpoint that reaches `peer`.
+    fn endpoint_for(&self, peer: IpAddr) -> &IrohEndpoint {
+        match &self.extra {
+            Some(extra) if extra.bind.serves(peer) => &extra.inner,
+            _ => &self.inner,
+        }
     }
 
     #[cfg(feature = "nearby-discovery")]
@@ -1700,7 +1783,8 @@ impl Endpoint {
     /// Connects to the exact expected identity at its explicit direct address.
     pub async fn connect(&self, peer: ExpectedPeer) -> Result<Connection, CarrierError> {
         let address = EndpointAddr::new(peer.id).with_ip_addr(peer.address);
-        self.connect_address(address, peer.id).await
+        self.connect_on(self.endpoint_for(peer.address.ip()), address, peer.id)
+            .await
     }
 
     /// Resolves and connects to one exact carrier identity through the
@@ -1755,9 +1839,18 @@ impl Endpoint {
         address: EndpointAddr,
         expected_id: EndpointId,
     ) -> Result<Connection, CarrierError> {
+        self.connect_on(&self.inner, address, expected_id).await
+    }
+
+    async fn connect_on(
+        &self,
+        endpoint: &IrohEndpoint,
+        address: EndpointAddr,
+        expected_id: EndpointId,
+    ) -> Result<Connection, CarrierError> {
         let inner = timeout(
             self.config.connect_timeout,
-            self.inner.connect(address, self.security_profile.alpn()),
+            endpoint.connect(address, self.security_profile.alpn()),
         )
         .await
         .map_err(|_| CarrierError::Timeout("connect"))?
@@ -1838,7 +1931,7 @@ impl Endpoint {
     }
 
     async fn accept_carrier(&self) -> Result<iroh::endpoint::Connection, CarrierError> {
-        let incoming = timeout(self.config.connect_timeout, self.inner.accept())
+        let incoming = timeout(self.config.connect_timeout, self.next_incoming())
             .await
             .map_err(|_| CarrierError::Timeout("accept"))?
             .ok_or_else(|| CarrierError::Transport("endpoint stopped accepting".into()))?;
@@ -1879,6 +1972,9 @@ impl Endpoint {
     /// Closes the endpoint and waits for its background tasks.
     pub async fn close(&self) {
         self.inner.close().await;
+        if let Some(extra) = &self.extra {
+            extra.inner.close().await;
+        }
     }
 }
 
@@ -3463,6 +3559,62 @@ mod tests {
             .expect("client");
         let (server_connection, client_connection) = connect_pair(&server, &client).await;
         (server, client, server_connection, client_connection)
+    }
+
+    #[test]
+    fn an_extra_bind_serves_only_its_subnet() {
+        let tailnet = ExtraBind {
+            address: "100.64.0.1:7471".parse().expect("address"),
+            prefix_len: 10,
+        };
+        assert!(tailnet.serves("100.127.9.9".parse().expect("ip")));
+        assert!(!tailnet.serves("100.128.0.1".parse().expect("ip")));
+        assert!(!tailnet.serves("fd88::1".parse().expect("ip")));
+        let tailnet = ExtraBind {
+            address: "[fd7a:115c:a1e0::1]:7471".parse().expect("address"),
+            prefix_len: 48,
+        };
+        assert!(tailnet.serves("fd7a:115c:a1e0:ab::2".parse().expect("ip")));
+        assert!(!tailnet.serves("fd88:7b7d:be2b:b001::1".parse().expect("ip")));
+    }
+
+    #[tokio::test]
+    async fn an_extra_network_has_its_own_endpoint_and_carries_connections_both_ways() {
+        let mut config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+        config.extra_bind = Some(ExtraBind {
+            address: "[::1]:0".parse().expect("address"),
+            prefix_len: 128,
+        });
+        let server = Endpoint::bind(SecretKey::generate(), config)
+            .await
+            .expect("server");
+        let client = Endpoint::bind(SecretKey::generate(), config)
+            .await
+            .expect("client");
+
+        // Each endpoint knows only its own socket, which is what keeps a contact
+        // on the main network from offering or probing the extra one.
+        let main = server.inner.bound_sockets();
+        assert!(main.iter().all(SocketAddr::is_ipv4), "{main:?}");
+        let extra = server.extra.as_ref().expect("extra endpoint");
+        let extra_sockets = extra.inner.bound_sockets();
+        assert!(extra_sockets.iter().all(SocketAddr::is_ipv6), "{extra_sockets:?}");
+
+        let allowed = BTreeSet::from([client.id()]);
+        let accepted = {
+            let server = server.clone();
+            tokio::spawn(async move { server.accept(&allowed).await })
+        };
+        let connection = client
+            .connect(ExpectedPeer {
+                id: server.id(),
+                address: extra_sockets[0],
+            })
+            .await
+            .expect("connect on the extra network");
+        let accepted = accepted.await.expect("join").expect("accept on the extra network");
+        assert_eq!(connection.remote_id(), server.id());
+        assert_eq!(accepted.remote_id(), client.id());
     }
 
     fn uni_deadline() -> tokio::time::Instant {

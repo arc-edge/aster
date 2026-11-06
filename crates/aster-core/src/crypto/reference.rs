@@ -78,6 +78,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
+use std::sync::Arc;
 use zeroize::Zeroize;
 
 const BUNDLE_MAGIC: &[u8; 8] = b"ASTRPB03";
@@ -514,6 +515,52 @@ pub struct ProvisioningBundle {
     control_route_key: Option<Secret32>,
     route_grants: Vec<RouteGrant>,
     content_grants: Vec<ContentGrant>,
+    // Not part of the serialized bundle: see `MissionCredentialTable`.
+    credential_table: Option<Arc<MissionCredentialTable>>,
+}
+
+/// Every member's authority-issued credential, held by each node of a mission.
+///
+/// A source envelope normally carries its publisher's credential and the
+/// authority's signature over it, about 6.6 kB that is the same on every item.
+/// A sealer with a table leaves both out, and a receiver takes them from its own
+/// table by the publisher id in the authenticated semantic header.
+///
+/// The table is not trusted. Its entries go through the same credential and
+/// publisher checks an inline credential does, so a wrong or forged entry fails
+/// authentication exactly as a bad inline credential would. An absent entry fails
+/// the item closed. Every node of a mission must hold the complete table.
+#[derive(Clone, Debug, Default)]
+pub struct MissionCredentialTable {
+    entries: BTreeMap<NodeId, (Vec<u8>, HybridSignature)>,
+}
+
+impl MissionCredentialTable {
+    /// Parses concatenated [`ReferenceEnvelopeSealer::credential_entry`] values.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, EnvelopeError> {
+        let mut reader = Reader::new(bytes);
+        let mut entries = BTreeMap::new();
+        while !reader.is_empty() {
+            let body = reader.u32_bytes(16 * 1024)?.to_vec();
+            let signature = decode_signature(&mut reader)?;
+            entries.insert(hash_domain(NODE_ID_DOMAIN, &body), (body, signature));
+        }
+        Ok(Self { entries })
+    }
+
+    /// Number of members in the table.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the table has no members.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn get(&self, node: &NodeId) -> Option<(Vec<u8>, HybridSignature)> {
+        self.entries.get(node).cloned()
+    }
 }
 
 impl fmt::Debug for ProvisioningBundle {
@@ -624,7 +671,14 @@ impl ProvisioningBundle {
             control_route_key,
             route_grants,
             content_grants,
+            credential_table: None,
         })
+    }
+
+    /// Attaches the mission's credential table for the sealer opened from this bundle.
+    pub fn with_credential_table(mut self, table: Arc<MissionCredentialTable>) -> Self {
+        self.credential_table = Some(table);
+        self
     }
 
     /// Returns the canonical unprotected inner representation.
@@ -1134,6 +1188,7 @@ impl ReferenceProvisioner {
             control_route_key: Some(control_route_key),
             route_grants,
             content_grants,
+            credential_table: None,
         })
     }
 
@@ -1501,6 +1556,7 @@ pub struct ReferenceEnvelopeSealer {
     route_grants: Vec<RouteGrant>,
     content_grants: Vec<ContentGrant>,
     rekey_route_authorizations: BTreeMap<(Scope, u64), Vec<NodeId>>,
+    credential_table: Option<Arc<MissionCredentialTable>>,
     zeroized: bool,
 }
 
@@ -1573,6 +1629,7 @@ impl ReferenceEnvelopeSealer {
         let mission = bundle.mission;
         let authority_id = bundle.authority_id;
         let authority_verifying_key = bundle.authority_verifying_key.clone();
+        let credential_table = bundle.credential_table.take();
         bundle.zeroize();
         Ok(Self {
             provider,
@@ -1587,8 +1644,17 @@ impl ReferenceEnvelopeSealer {
             route_grants,
             content_grants,
             rekey_route_authorizations: BTreeMap::new(),
+            credential_table,
             zeroized: false,
         })
+    }
+
+    /// Returns this node's entry for a [`MissionCredentialTable`].
+    pub fn credential_entry(&self) -> Result<Vec<u8>, EnvelopeError> {
+        let mut entry = Vec::new();
+        push_u32_bytes(&mut entry, &self.credential.body)?;
+        encode_signature(&mut entry, &self.credential.signature)?;
+        Ok(entry)
     }
 
     /// Stable unique identity authenticated by the provisioned authority credential.
@@ -2380,8 +2446,13 @@ impl ReferenceEnvelopeSealer {
 
         let mut route = Vec::new();
         route.push(EnvelopeKind::Data as u8);
-        push_u32_bytes(&mut route, &self.credential.body)?;
-        encode_signature(&mut route, &self.credential.signature)?;
+        if self.credential_table.is_some() {
+            // An empty body means the receiver's table holds the credential.
+            push_u32_bytes(&mut route, &[])?;
+        } else {
+            push_u32_bytes(&mut route, &self.credential.body)?;
+            encode_signature(&mut route, &self.credential.signature)?;
+        }
         route.extend_from_slice(&item_id);
         encode_header(&mut route, request.header)?;
         route.extend_from_slice(&content_group);
@@ -2530,6 +2601,7 @@ impl ReferenceEnvelopeSealer {
                 self.authority_id,
                 &self.authority_verifying_key,
                 &self.provider,
+                self.credential_table.as_deref(),
             );
             if let Ok(route) = decoded
                 && route.header.scope == grant.scope
@@ -3121,6 +3193,7 @@ impl ReferenceEnvelopeSealer {
             self.authority_id,
             &self.authority_verifying_key,
             &self.provider,
+            self.credential_table.as_deref(),
         )?;
         self.build_verified_bridge_source(
             source_envelope,
@@ -4430,6 +4503,7 @@ struct SessionEndpoint {
     credential: Credential,
     signing_key: RustCryptoSigningKey,
     mission_proof_key: Secret32,
+    credential_table: Option<Arc<MissionCredentialTable>>,
 }
 
 impl SessionEndpoint {
@@ -4487,6 +4561,7 @@ impl SessionEndpoint {
             .control_route_key
             .take()
             .ok_or_else(authentication_failed)?;
+        let credential_table = bundle.credential_table.take();
         bundle.zeroize();
         Ok(Self {
             provider,
@@ -4496,14 +4571,31 @@ impl SessionEndpoint {
             credential,
             signing_key,
             mission_proof_key,
+            credential_table,
         })
+    }
+
+    /// Whether this endpoint names its credential by id in handshake flights.
+    fn sends_credential_reference(&self) -> bool {
+        self.credential_table.is_some()
     }
 
     fn decode_peer_credential(
         &self,
-        body: Vec<u8>,
-        signature: HybridSignature,
+        credential: FlightCredential,
     ) -> Result<Credential, EnvelopeError> {
+        // A reference resolves to the same bytes an inline credential carries,
+        // and everything below applies unchanged. The handshake signature
+        // verifies against the key found here, so the peer still proves it
+        // holds that credential's key.
+        let (body, signature) = match credential {
+            FlightCredential::Inline(body, signature) => (body, signature),
+            FlightCredential::Reference(identity) => self
+                .credential_table
+                .as_ref()
+                .and_then(|table| table.get(&identity))
+                .ok_or_else(authentication_failed)?,
+        };
         let peer = decode_credential(
             body,
             signature,
@@ -4653,7 +4745,7 @@ impl ReferenceSessionInitiator {
                 Ok(opened) => opened,
                 Err(error) => return Err((self, handshake_error(error))),
             };
-        let (proof_commitment, credential_body, credential_signature) =
+        let (proof_commitment, credential) =
             match decode_server_auth_context(opened.credential_context()) {
                 Ok(context) => context,
                 Err(error) => return Err((self, error)),
@@ -4661,10 +4753,7 @@ impl ReferenceSessionInitiator {
         if proof_commitment != self.mission_proof_commitment {
             return Err((self, authentication_failed()));
         }
-        let peer = match self
-            .endpoint
-            .decode_peer_credential(credential_body, credential_signature)
-        {
+        let peer = match self.endpoint.decode_peer_credential(credential) {
             Ok(peer) => peer,
             Err(error) => return Err((self, error)),
         };
@@ -4674,7 +4763,10 @@ impl ReferenceSessionInitiator {
                 Ok(authenticated) => authenticated,
                 Err(error) => return Err((self, handshake_error(error))),
             };
-        let credential_context = match encode_client_auth_context(&self.endpoint.credential) {
+        let credential_context = match encode_client_auth_context(
+            &self.endpoint.credential,
+            self.endpoint.sends_credential_reference(),
+        ) {
             Ok(context) => context,
             Err(error) => return Err((self, error)),
         };
@@ -4836,11 +4928,14 @@ impl ReferenceSessionResponder {
             Ok(commitment) => commitment,
             Err(error) => return Err((self, error)),
         };
-        let credential_context =
-            match encode_server_auth_context(proof_commitment, &self.endpoint.credential) {
-                Ok(context) => context,
-                Err(error) => return Err((self, error)),
-            };
+        let credential_context = match encode_server_auth_context(
+            proof_commitment,
+            &self.endpoint.credential,
+            self.endpoint.sends_credential_reference(),
+        ) {
+            Ok(context) => context,
+            Err(error) => return Err((self, error)),
+        };
         // Mission proof verification deliberately precedes P-256 agreement and ML-KEM
         // encapsulation so unauthenticated probes cannot trigger the expensive response.
         let prepared = match ResponderHandshakePrepared::respond_with_supported_versions(
@@ -4907,15 +5002,11 @@ impl ReferenceSessionResponderPending {
                 Ok(inspected) => inspected,
                 Err(error) => return Err((self, handshake_error(error))),
             };
-        let (credential_body, credential_signature) =
-            match decode_client_auth_context(opened.credential_context()) {
-                Ok(context) => context,
-                Err(error) => return Err((self, error)),
-            };
-        let peer = match self
-            .endpoint
-            .decode_peer_credential(credential_body, credential_signature)
-        {
+        let credential = match decode_client_auth_context(opened.credential_context()) {
+            Ok(context) => context,
+            Err(error) => return Err((self, error)),
+        };
+        let peer = match self.endpoint.decode_peer_credential(credential) {
             Ok(peer) => peer,
             Err(error) => return Err((self, error)),
         };
@@ -5808,21 +5899,46 @@ fn encode_flight_credential(
     encode_signature(output, &credential.signature)
 }
 
-fn decode_flight_credential(
-    reader: &mut Reader<'_>,
-) -> Result<(Vec<u8>, HybridSignature), EnvelopeError> {
-    let body = reader.u32_bytes(16 * 1024)?.to_vec();
-    let signature = decode_signature(reader)?;
-    Ok((body, signature))
+/// A handshake credential: complete, or the id of a member the receiver's
+/// [`MissionCredentialTable`] holds. A credential body is thousands of bytes, so
+/// a 32-byte body can only be an id.
+enum FlightCredential {
+    Inline(Vec<u8>, HybridSignature),
+    Reference(NodeId),
 }
 
-fn encode_client_auth_context(credential: &Credential) -> Result<Vec<u8>, EnvelopeError> {
+fn decode_flight_credential(reader: &mut Reader<'_>) -> Result<FlightCredential, EnvelopeError> {
+    let body = reader.u32_bytes(16 * 1024)?;
+    if let Ok(identity) = NodeId::try_from(body) {
+        return Ok(FlightCredential::Reference(identity));
+    }
+    let body = body.to_vec();
+    let signature = decode_signature(reader)?;
+    Ok(FlightCredential::Inline(body, signature))
+}
+
+fn encode_session_credential(
+    output: &mut Vec<u8>,
+    credential: &Credential,
+    by_reference: bool,
+) -> Result<(), EnvelopeError> {
+    if by_reference {
+        push_u32_bytes(output, &credential.identity)
+    } else {
+        encode_flight_credential(output, credential)
+    }
+}
+
+fn encode_client_auth_context(
+    credential: &Credential,
+    by_reference: bool,
+) -> Result<Vec<u8>, EnvelopeError> {
     let mut output = Vec::new();
-    encode_flight_credential(&mut output, credential)?;
+    encode_session_credential(&mut output, credential, by_reference)?;
     Ok(output)
 }
 
-fn decode_client_auth_context(bytes: &[u8]) -> Result<(Vec<u8>, HybridSignature), EnvelopeError> {
+fn decode_client_auth_context(bytes: &[u8]) -> Result<FlightCredential, EnvelopeError> {
     let mut reader = Reader::new(bytes);
     let credential = decode_flight_credential(&mut reader)?;
     reader.finish()?;
@@ -5832,21 +5948,20 @@ fn decode_client_auth_context(bytes: &[u8]) -> Result<(Vec<u8>, HybridSignature)
 fn encode_server_auth_context(
     mission_proof_commitment: [u8; 32],
     credential: &Credential,
+    by_reference: bool,
 ) -> Result<Vec<u8>, EnvelopeError> {
     let mut output = Vec::new();
     output.extend_from_slice(&mission_proof_commitment);
-    encode_flight_credential(&mut output, credential)?;
+    encode_session_credential(&mut output, credential, by_reference)?;
     Ok(output)
 }
 
-fn decode_server_auth_context(
-    bytes: &[u8],
-) -> Result<([u8; 32], Vec<u8>, HybridSignature), EnvelopeError> {
+fn decode_server_auth_context(bytes: &[u8]) -> Result<([u8; 32], FlightCredential), EnvelopeError> {
     let mut reader = Reader::new(bytes);
     let mission_proof_commitment = reader.array::<32>()?;
-    let (credential, signature) = decode_flight_credential(&mut reader)?;
+    let credential = decode_flight_credential(&mut reader)?;
     reader.finish()?;
-    Ok((mission_proof_commitment, credential, signature))
+    Ok((mission_proof_commitment, credential))
 }
 
 fn mission_proof_aad(hello_hash: &[u8; 32]) -> Vec<u8> {
@@ -7361,13 +7476,31 @@ fn decode_data_route(
     authority_id: NodeId,
     authority_key: &HybridVerifyingKey,
     provider: &RustCryptoProvider<SysRng>,
+    credential_table: Option<&MissionCredentialTable>,
 ) -> Result<DecodedDataRoute, EnvelopeError> {
     let mut reader = Reader::new(bytes);
     if EnvelopeKind::decode(reader.u8()?)? != EnvelopeKind::Data {
         return Err(authentication_failed());
     }
     let credential_body = reader.u32_bytes(16 * 1024)?.to_vec();
-    let credential_signature = decode_signature(&mut reader)?;
+    let inline_credential = if credential_body.is_empty() {
+        None
+    } else {
+        Some((credential_body, decode_signature(&mut reader)?))
+    };
+    if derive_authority_id(mission, authority_key) != authority_id {
+        return Err(authentication_failed());
+    }
+    let item_id = reader.array::<32>()?;
+    let header = decode_header(&mut reader)?;
+    // A table entry takes the same path as an inline credential: its identity
+    // must equal this publisher, and `decode_credential` verifies the rest.
+    let (credential_body, credential_signature) = match inline_credential {
+        Some(inline) => inline,
+        None => credential_table
+            .and_then(|table| table.get(&header.stamp.dot.publisher))
+            .ok_or_else(authentication_failed)?,
+    };
     let credential = decode_credential(
         credential_body,
         credential_signature,
@@ -7375,11 +7508,6 @@ fn decode_data_route(
         authority_key,
         provider,
     )?;
-    if derive_authority_id(mission, authority_key) != authority_id {
-        return Err(authentication_failed());
-    }
-    let item_id = reader.array::<32>()?;
-    let header = decode_header(&mut reader)?;
     let content_group = reader.array::<32>()?;
     let content_nonce = reader.array::<NONCE_LEN>()?;
     let batch_id = reader.array::<32>()?;
@@ -7917,6 +8045,10 @@ impl<'a> Reader<'a> {
         Self { bytes, offset: 0 }
     }
 
+    fn is_empty(&self) -> bool {
+        self.position() == self.bytes.len()
+    }
+
     fn position(&self) -> usize {
         self.offset
     }
@@ -8256,6 +8388,125 @@ mod tests {
     fn service(bundle: ProvisioningBundle) -> ReferenceEnvelopeSealer {
         ReferenceEnvelopeSealer::open(bundle)
             .unwrap_or_else(|error| panic!("test service open failed: {error}"))
+    }
+
+    /// Two members of one mission with a table holding both credentials.
+    fn table_members() -> (ProvisioningBundle, ProvisioningBundle, Arc<MissionCredentialTable>) {
+        let mut provisioner = ReferenceProvisioner::from_seed([7; 32])
+            .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
+        let mut issue = |serial| {
+            provisioner
+                .issue_node(serial, &[member_access(vec![1])])
+                .unwrap_or_else(|error| panic!("issue failed: {error}"))
+        };
+        let (first, second) = (issue(1), issue(2));
+        let bytes = |bundle: &ProvisioningBundle| {
+            ProvisioningBundle::from_bytes(&bundle.to_bytes().expect("bundle bytes"))
+                .expect("bundle copy")
+        };
+        let mut entries = service(bytes(&first)).credential_entry().expect("entry");
+        entries.extend(service(bytes(&second)).credential_entry().expect("entry"));
+        let table = MissionCredentialTable::from_bytes(&entries).expect("table");
+        assert_eq!(table.len(), 2);
+        (first, second, Arc::new(table))
+    }
+
+    fn sealed_by(publisher: &mut ReferenceEnvelopeSealer) -> SealedEnvelope {
+        let header = header(publisher.identity(), 1);
+        publisher
+            .seal(SealRequest {
+                header: &header,
+                payload: b"payload",
+            })
+            .expect("seal")
+    }
+
+    #[test]
+    fn a_table_leaves_the_credential_out_and_the_publisher_still_authenticates() {
+        let (first, second, table) = table_members();
+        let copy = ProvisioningBundle::from_bytes(&first.to_bytes().expect("bytes")).expect("copy");
+        let inline = sealed_by(&mut service(copy));
+        let mut publisher = service(first.with_credential_table(Arc::clone(&table)));
+        let compact = sealed_by(&mut publisher);
+        assert!(
+            inline.bytes.len() - compact.bytes.len() > 6_000,
+            "credential left the envelope: {} -> {}",
+            inline.bytes.len(),
+            compact.bytes.len()
+        );
+
+        let mut receiver = service(second.with_credential_table(table));
+        let verified = receiver.inspect(&compact.bytes).expect("compact envelope");
+        assert_eq!(verified.header.stamp.dot.publisher, publisher.identity());
+        // An inline envelope still opens at a node with a table.
+        assert!(receiver.inspect(&inline.bytes).is_ok());
+    }
+
+    #[test]
+    fn a_compact_envelope_fails_closed_without_the_publishers_table_entry() {
+        let (first, second, table) = table_members();
+        let compact = sealed_by(&mut service(first.with_credential_table(table)));
+        let copy = ProvisioningBundle::from_bytes(&second.to_bytes().expect("bytes")).expect("copy");
+        // No table at all, then a table that lacks this publisher.
+        assert!(service(second).inspect(&compact.bytes).is_err());
+        let empty = Arc::new(MissionCredentialTable::default());
+        assert!(
+            service(copy.with_credential_table(empty))
+                .inspect(&compact.bytes)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_table_entry_cannot_stand_in_for_another_publisher() {
+        // The table is keyed by the hash of each body, so the only way to attack
+        // it is a body with a forged authority signature. That must fail in the
+        // same credential check an inline credential goes through.
+        let (first, second, table) = table_members();
+        let compact = sealed_by(&mut service(first.with_credential_table(Arc::clone(&table))));
+        let mut forged = (*table).clone();
+        for (_, signature) in forged.entries.values_mut() {
+            signature.ml_dsa_65.as_mut().expect("ml-dsa signature")[0] ^= 1;
+        }
+        assert!(
+            service(second.with_credential_table(Arc::new(forged)))
+                .inspect(&compact.bytes)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_table_shrinks_the_handshake_and_mutual_authentication_still_completes() {
+        let (first, second, table) = table_members();
+        let (first_id, second_id) = (bundle_identity(&first), bundle_identity(&second));
+        let (initiator, flight_one) = ReferenceSessionInitiator::start(
+            first.with_credential_table(Arc::clone(&table)),
+        )
+        .expect("start");
+        let responder =
+            ReferenceSessionResponder::open(second.with_credential_table(table)).expect("open");
+        let (pending, flight_two) = responder.receive_client(&flight_one).expect("client");
+        let (initiator_pending, flight_three) = initiator.receive_server(&flight_two).expect("server");
+        assert!(flight_two.len() + flight_three.len() < 12_000);
+        let (responder_session, flight_four) = pending.receive_client_auth(&flight_three).expect("auth");
+        let initiator_session = initiator_pending.receive_finished(&flight_four).expect("finished");
+        assert_eq!(responder_session.peer_identity(), first_id);
+        assert_eq!(initiator_session.peer_identity(), second_id);
+    }
+
+    #[test]
+    fn a_handshake_reference_to_a_member_the_responder_does_not_hold_fails() {
+        let (first, second, table) = table_members();
+        let (initiator, flight_one) =
+            ReferenceSessionInitiator::start(first.with_credential_table(table)).expect("start");
+        let empty = Arc::new(MissionCredentialTable::default());
+        let responder =
+            ReferenceSessionResponder::open(second.with_credential_table(empty)).expect("open");
+        // The responder sends its own reference, which the initiator can resolve,
+        // and refuses the initiator's, which it can't.
+        let (pending, flight_two) = responder.receive_client(&flight_one).expect("client");
+        let (_, flight_three) = initiator.receive_server(&flight_two).expect("server");
+        assert!(pending.receive_client_auth(&flight_three).is_err());
     }
 
     struct BridgeProviderServices {

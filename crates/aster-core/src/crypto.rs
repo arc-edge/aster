@@ -36,7 +36,8 @@ pub(crate) use reference::{
     VerifiedBridgeSourceRoute, VerifiedBridgeWrapper,
 };
 pub use reference::{
-    ProvisioningAccess, ProvisioningBundle, REFERENCE_SESSION_FRAME_OVERHEAD_BYTES,
+    MissionCredentialTable, ProvisioningAccess, ProvisioningBundle,
+    REFERENCE_SESSION_FRAME_OVERHEAD_BYTES,
     ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceProvisioner,
     ReferenceSessionAwaitingFinished, ReferenceSessionInitiator, ReferenceSessionResponder,
     ReferenceSessionResponderPending, ScopeRekeyPlan, ScopeRekeyRecipient,

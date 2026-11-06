@@ -38,8 +38,8 @@ use std::os::unix::{
 use std::sync::LazyLock;
 
 use aster_iroh::{
-    CarrierError, Endpoint, EndpointConfig, EndpointId, ExpectedPeer, PeerRoute, PinnedRelay,
-    ReceiveUniTurn, SelectedPath, SendUniTurn,
+    CarrierError, Endpoint, EndpointConfig, EndpointId, ExpectedPeer, ExtraBind, PeerRoute,
+    PinnedRelay, ReceiveUniTurn, SelectedPath, SendUniTurn,
 };
 #[cfg(feature = "nearby-discovery")]
 use aster_iroh::{
@@ -996,6 +996,7 @@ struct ConfiguredPeer {
     carrier: EndpointId,
     mission: NodeId,
     locator: PeerLocator,
+    fallback: Option<SocketAddr>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1066,6 +1067,7 @@ impl From<MissionExpectedPeer> for ConfiguredPeer {
             carrier: peer.carrier.id,
             mission: peer.mission,
             locator: PeerLocator::Direct(peer.carrier.address),
+            fallback: None,
         }
     }
 }
@@ -1155,6 +1157,7 @@ pub struct MutableSourceInterests {
     state: Vec<SourceInterestSelector>,
     record: Vec<SourceInterestSelector>,
     blob: Vec<SourceInterestSelector>,
+    event_only: bool,
 }
 
 impl MutableSourceInterests {
@@ -1165,7 +1168,26 @@ impl MutableSourceInterests {
             state,
             record,
             blob: Vec::new(),
+            event_only: false,
         }
+    }
+
+    /// Selects contacts that end after Event transfer.
+    ///
+    /// The State, Record, Blob and Event-bridge lanes cost protected round trips
+    /// on every contact even when they have nothing to move, which dominates a
+    /// narrow or high-latency link. This is deployment configuration rather
+    /// than a negotiated profile: every node of a mission must set the same
+    /// value, and a mismatch fails the contact closed at the next lane.
+    pub fn event_only() -> Self {
+        Self {
+            event_only: true,
+            ..Self::default()
+        }
+    }
+
+    const fn is_event_only(&self) -> bool {
+        self.event_only
     }
 
     /// Adds the explicit Blob source/content selector set.
@@ -1640,8 +1662,38 @@ pub struct SelectedForwardingConfig {
     scope_quotas: Vec<CustodyQuota>,
     event_bridge: Option<SelectedEventBridgeConfig>,
     controlled_relay: Option<ControlledRelayRouting>,
+    contact_pacing: Option<ContactPacing>,
+    peer_fallbacks: BTreeMap<EndpointId, SocketAddr>,
+    extra_bind: Option<ExtraBind>,
     #[cfg(feature = "nearby-discovery")]
     nearby_discovery: Option<NearbyDiscoveryRouting>,
+}
+
+/// How often a node contacts one peer on a link where contacts are expensive.
+///
+/// Keep the sync interval well below `news`: a deferred contact starts on the
+/// first tick after its wait ends.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContactPacing {
+    /// Shortest time between contacts while this node has an Event the peer
+    /// may lack. The Event stays armed, so one contact carries all that arrived
+    /// during the wait.
+    pub news: Duration,
+    /// Time between contacts with no known news. These are what repair anything
+    /// a failed contact left behind, so this bounds how long that can last.
+    pub idle: Duration,
+}
+
+impl ContactPacing {
+    /// Whether a contact with a peer must wait. Both sides of a pair with news
+    /// would otherwise come due on the same tick and collide, spending a
+    /// handshake for nothing, so the higher identity waits one tick longer and
+    /// is normally beaten to it.
+    fn defers(self, has_news: bool, lower_identity: bool, tick: Duration, quiet: Duration) -> bool {
+        let wait = if has_news { self.news } else { self.idle };
+        let stagger = if lower_identity { Duration::ZERO } else { tick };
+        quiet < wait.saturating_add(stagger)
+    }
 }
 
 /// One explicitly selected, operator-controlled relay route.
@@ -1675,9 +1727,36 @@ impl SelectedForwardingConfig {
             scope_quotas: Vec::new(),
             event_bridge: None,
             controlled_relay: None,
+            contact_pacing: None,
+            peer_fallbacks: BTreeMap::new(),
+            extra_bind: None,
             #[cfg(feature = "nearby-discovery")]
             nearby_discovery: None,
         }
+    }
+
+    /// Paces outbound contacts for a link where each one is expensive.
+    ///
+    /// Without this a new Event starts a contact at once, so a steady publisher
+    /// pays one full contact per Event however long the sync interval is, and
+    /// every sync tick starts a contact whether or not there is news.
+    pub const fn with_contact_pacing(mut self, pacing: ContactPacing) -> Self {
+        self.contact_pacing = Some(pacing);
+        self
+    }
+
+    /// Sets a second direct address for configured peers, tried only after the
+    /// peer's own address fails to connect. Identity checks are unchanged: this
+    /// selects a path to the same carrier and mission identity.
+    pub fn with_peer_fallbacks(mut self, fallbacks: BTreeMap<EndpointId, SocketAddr>) -> Self {
+        self.peer_fallbacks = fallbacks;
+        self
+    }
+
+    /// Adds a socket on a second network. See [`ExtraBind`].
+    pub const fn with_extra_bind(mut self, extra_bind: ExtraBind) -> Self {
+        self.extra_bind = Some(extra_bind);
+        self
     }
 
     /// Returns the initial Event emission policy.
@@ -1933,10 +2012,9 @@ impl Default for SelectedForwardingConfig {
 /// identity, so a stopped handle and a later runtime in the same boot share a
 /// checkpoint domain. Linux uses the suspend-inclusive boot clock. A missing or
 /// malformed boot UUID falls back to process-local continuity and disables
-/// finite custody. This crate cannot safely call macOS `mach_continuous_time`
-/// under its no-unsafe policy, so finite custody is explicitly disabled there;
-/// `CLOCK_MONOTONIC` remains usable only for durable v3 scheduling. Other Unix
-/// monotonic sources and the process-local non-Unix fallback likewise have no
+/// finite custody. macOS documents `CLOCK_MONOTONIC` as continuing through
+/// sleep, so it serves finite custody there with `kern.boottime` as the domain.
+/// Other Unix monotonic sources and the process-local non-Unix fallback have no
 /// proven suspend-inclusive contract; durable v3 scheduling remains portable.
 #[derive(Clone, Debug)]
 pub(crate) struct NodeCustodyClock {
@@ -1998,7 +2076,11 @@ impl NodeCustodyClock {
                     domain.extend_from_slice(&output.stdout);
                 }
             }
-            Self::from_domain(identity, domain, false)
+            // macOS CLOCK_MONOTONIC keeps counting through sleep (clock_gettime(3)),
+            // and kern.boottime pins the domain to one boot, which is what finite
+            // custody needs. Other platforms have no such documented clock.
+            let finite_ttl_supported = cfg!(target_os = "macos") && !domain.is_empty();
+            Self::from_domain(identity, domain, finite_ttl_supported)
         }
     }
 
@@ -15316,22 +15398,22 @@ fn validate_node_config(config: &NodeConfig) -> Result<BTreeMap<EndpointId, Node
 
 fn configured_runtime_peers(
     config: &NodeConfig,
-    _forwarding: &SelectedForwardingConfig,
+    forwarding: &SelectedForwardingConfig,
     direct: BTreeMap<EndpointId, NodeId>,
 ) -> Result<(BTreeMap<EndpointId, NodeId>, Vec<ConfiguredPeer>), NodeError> {
     #[cfg(feature = "nearby-discovery")]
-    if let Some(nearby) = &_forwarding.nearby_discovery {
+    if let Some(nearby) = &forwarding.nearby_discovery {
         if !config.peers.is_empty() {
             return Err(NodeError::Configuration(
                 "nearby discovery cannot be combined with direct peer routes".into(),
             ));
         }
-        if _forwarding.controlled_relay.is_some() {
+        if forwarding.controlled_relay.is_some() {
             return Err(NodeError::Configuration(
                 "nearby discovery cannot be combined with a controlled relay".into(),
             ));
         }
-        if _forwarding.emission_policy != EventEmissionPolicy::Normal {
+        if forwarding.emission_policy != EventEmissionPolicy::Normal {
             return Err(NodeError::Configuration(
                 "nearby discovery requires the Normal emission policy".into(),
             ));
@@ -15382,6 +15464,10 @@ fn configured_runtime_peers(
         .iter()
         .copied()
         .map(ConfiguredPeer::from)
+        .map(|peer| ConfiguredPeer {
+            fallback: forwarding.peer_fallbacks.get(&peer.carrier).copied(),
+            ..peer
+        })
         .collect();
     Ok((direct, peers))
 }
@@ -17391,7 +17477,10 @@ async fn run_node_actor_inner(
     }
     #[cfg(unix)]
     let zeroization_control = LocalZeroizationControl::bind_pinned(&state_root.path, &store_path)?;
-    let endpoint_config = EndpointConfig::direct(config.bind);
+    let endpoint_config = EndpointConfig {
+        extra_bind: forwarding.extra_bind,
+        ..EndpointConfig::direct(config.bind)
+    };
     let endpoint = match &forwarding.controlled_relay {
         Some(routing) if routing.relay_only => {
             Endpoint::bind_relay_only(identity.secret()?, endpoint_config, routing.relay.clone())
@@ -17815,6 +17904,7 @@ async fn run_node_actor_inner(
     let mut outbound_abort_handles = BTreeMap::<EndpointId, (TaskId, AbortHandle)>::new();
     let mut collision_aborted_outbound = BTreeSet::<TaskId>::new();
     let non_preferred_fallback_delay = non_preferred_contact_fallback_delay(config.sync_interval);
+    let contact_pacing = forwarding.contact_pacing;
     let contact_election_started = Instant::now();
     let mut peer_contact_activity = configured_peers
         .iter()
@@ -18473,6 +18563,18 @@ async fn run_node_actor_inner(
                     let peer = contact_peers[(start + offset) % peer_count];
                     let peer_id = peer.carrier();
                     if !event_contact_wake.considers(peer_id, contact_cause) {
+                        continue;
+                    }
+                    // A deferred peer keeps its armed Event edge for a later tick.
+                    if let (Some(pacing), Some(last)) =
+                        (contact_pacing, peer_contact_activity.get(&peer_id))
+                        && pacing.defers(
+                            event_contact_wake.bypasses_fallback(peer_id),
+                            local_id < peer_id,
+                            config.sync_interval,
+                            election_now.saturating_duration_since(*last),
+                        )
+                    {
                         continue;
                     }
                     let last_activity = peer_contact_activity
@@ -19578,6 +19680,20 @@ async fn sync_once_with_forwarding(
         })?
 }
 
+/// Connects on `address`, then on `fallback` if that fails. The fallback is the
+/// costlier path, so a working primary is always tried first.
+async fn connect_with_fallback(
+    endpoint: &Endpoint,
+    id: EndpointId,
+    address: SocketAddr,
+    fallback: Option<SocketAddr>,
+) -> Result<aster_iroh::Connection, CarrierError> {
+    match (endpoint.connect(ExpectedPeer { id, address }).await, fallback) {
+        (Err(_), Some(address)) => endpoint.connect(ExpectedPeer { id, address }).await,
+        (connected, _) => connected,
+    }
+}
+
 async fn sync_session(
     endpoint: &Endpoint,
     contact: OutboundContact,
@@ -19621,16 +19737,10 @@ async fn sync_session(
             ContactPeer::Configured(ConfiguredPeer {
                 carrier,
                 locator: PeerLocator::Direct(address),
+                fallback,
                 ..
             }),
-        ) => {
-            endpoint
-                .connect(ExpectedPeer {
-                    id: carrier,
-                    address,
-                })
-                .await?
-        }
+        ) => connect_with_fallback(endpoint, carrier, address, fallback).await?,
         #[cfg(feature = "nearby-discovery")]
         (
             None,
@@ -28536,6 +28646,13 @@ async fn sync_authenticated_session(
     )
     .await?;
 
+    if mutable_interests.is_event_only() {
+        event_guard.check(store)?;
+        let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+        let completed = complete_peer_contact(connection, receipt, event_policy);
+        connection.finish_as_initiator().await?;
+        return Ok(completed);
+    }
     if !matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
         sync_mutable_classes(
             store,
@@ -30899,6 +31016,13 @@ async fn serve_session(
     )
     .await?;
 
+    if mutable_interests.is_event_only() {
+        event_guard.check(&store)?;
+        let event_policy = ContactEventPolicy::capture(event_guard.replication_policy());
+        let completed = complete_peer_contact(&connection, receipt, event_policy);
+        connection.finish_as_responder().await?;
+        return Ok(completed);
+    }
     if !matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
         serve_mutable_classes(
             &store,
@@ -34493,7 +34617,7 @@ mod tests {
         let second = NodeCustodyClock::open(identity).expect("second macOS custody clock");
 
         assert_eq!(first.clock_id, second.clock_id);
-        assert!(!first.supports_finite_ttl());
+        assert!(first.supports_finite_ttl());
         let earlier = first.sample().expect("first monotonic sample");
         let later = first.sample().expect("second monotonic sample");
         assert_eq!(earlier.clock_id, later.clock_id);
@@ -34546,6 +34670,35 @@ mod tests {
         ] {
             assert_eq!(parse_linux_boot_id(malformed), None, "{malformed:?}");
         }
+    }
+
+    #[test]
+    fn contact_pacing_waits_for_news_or_the_idle_period() {
+        let pacing = ContactPacing {
+            news: Duration::from_secs(5),
+            idle: Duration::from_secs(30),
+        };
+        let tick = Duration::from_secs(1);
+        let secs = Duration::from_secs;
+        // With news a contact starts once the short wait has passed.
+        assert!(pacing.defers(true, true, tick, secs(4)));
+        assert!(!pacing.defers(true, true, tick, secs(5)));
+        // With no news the link stays quiet for the long wait.
+        assert!(pacing.defers(false, true, tick, secs(29)));
+        assert!(!pacing.defers(false, true, tick, secs(30)));
+    }
+
+    #[test]
+    fn the_higher_identity_of_a_pair_waits_one_tick_so_they_do_not_collide() {
+        let pacing = ContactPacing {
+            news: Duration::from_secs(5),
+            idle: Duration::from_secs(30),
+        };
+        let tick = Duration::from_secs(1);
+        let quiet = Duration::from_secs(5);
+        assert!(!pacing.defers(true, true, tick, quiet));
+        assert!(pacing.defers(true, false, tick, quiet));
+        assert!(!pacing.defers(true, false, tick, quiet + tick));
     }
 
     #[test]
@@ -38111,6 +38264,7 @@ mod tests {
                 carrier: peer,
                 mission: [0x91; 32],
                 locator: PeerLocator::Direct(SocketAddr::from(([127, 0, 0, 1], 9))),
+                fallback: None,
             }),
             true,
             &BTreeSet::new(),

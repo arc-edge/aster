@@ -23,8 +23,8 @@ use aster_mesh::{
     BlobCustodyClaimV2, BlobCustodyDirectionV1, ClassicalAuthenticatedSession,
     ClassicalProvisioningBundle, ClassicalSessionInitiator, ClassicalSessionResponder,
     CustodyClaims, CustodyExpectation, MAX_PROTECTED_PROVISIONING_BYTES,
-    MAX_UNPROTECTED_PROVISIONING_BYTES, NodeId, OpenedBlobSourceFrameV1, ProvisioningBundle,
-    ProvisioningLoadId, ProvisioningProtectionError, ProvisioningSecretLoader,
+    MAX_UNPROTECTED_PROVISIONING_BYTES, MissionCredentialTable, NodeId, OpenedBlobSourceFrameV1,
+    ProvisioningBundle, ProvisioningLoadId, ProvisioningProtectionError, ProvisioningSecretLoader,
     ProvisioningSecretRef, ProvisioningSecretStoreError, ProvisioningUnprotector,
     ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceSessionAwaitingFinished,
     ReferenceSessionInitiator, ReferenceSessionResponder, ReferenceSessionResponderPending,
@@ -766,9 +766,23 @@ pub struct UnprotectedReferenceMission {
     secret_ref: Option<ProvisioningSecretRef>,
     provisioning_origin: MissionProvisioningOrigin,
     protected_state_witness: Option<PathBuf>,
+    credential_table: Option<Arc<MissionCredentialTable>>,
 }
 
 impl UnprotectedReferenceMission {
+    /// Returns this node's entry for a mission credential table.
+    pub fn credential_entry(&self) -> Result<Vec<u8>, MissionSessionError> {
+        Ok(ReferenceEnvelopeSealer::open(self.fresh_bundle()?)?.credential_entry()?)
+    }
+
+    /// Seals and opens this mission's items against `table`, which leaves each
+    /// member's credential out of the envelope. Every member must use the same
+    /// table. See [`MissionCredentialTable`].
+    pub fn with_credential_table(mut self, table: MissionCredentialTable) -> Self {
+        self.credential_table = Some(Arc::new(table));
+        self
+    }
+
     /// Validates and owns canonical unprotected reference bundle bytes.
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self, MissionProvisioningError> {
         let encoded = UnprotectedProvisioning::new(bytes)?;
@@ -857,6 +871,7 @@ impl UnprotectedReferenceMission {
             secret_ref: None,
             provisioning_origin: MissionProvisioningOrigin::UnprotectedReference,
             protected_state_witness: None,
+            credential_table: None,
         })
     }
 
@@ -951,7 +966,11 @@ impl UnprotectedReferenceMission {
                 "mission provisioning has been zeroized".into(),
             )));
         }
-        ProvisioningBundle::from_bytes(encoded.expose()).map_err(Into::into)
+        let bundle = ProvisioningBundle::from_bytes(encoded.expose())?;
+        Ok(match &self.credential_table {
+            Some(table) => bundle.with_credential_table(Arc::clone(table)),
+            None => bundle,
+        })
     }
 }
 
