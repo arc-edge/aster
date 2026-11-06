@@ -1206,7 +1206,8 @@ impl MutableSourceInterests {
     ///
     /// Since no peer then schedules an Event at the end of its life, the fence an
     /// expired Event leaves also stays out of this node's reconciliation baseline,
-    /// so the baseline matches what peers offer.
+    /// so the baseline matches what peers offer. Rows withheld after a reboot go
+    /// into it, so peers stop re-sending what this node holds and can't forward.
     pub const fn with_min_send_remaining(mut self, remaining: Duration) -> Self {
         self.min_send_remaining = remaining;
         self
@@ -11962,13 +11963,18 @@ fn transfer_inventory_for_receiver(
             if !verifier.can_route_event(&fence.scope, fence.key_epoch) {
                 continue;
             }
+            // A withheld row fences only with a send margin set. Upstream leaves it
+            // out, so every peer offers it again on every contact.
+            if min_send_remaining.is_zero() && fence.reason.is_none() {
+                continue;
+            }
             // With a send margin no peer schedules an Event at the end of its life,
             // so an expired one's fence suppresses nothing, and in the baseline it
             // would keep this set different from every sender's. A late offer lands
             // as a duplicate only on an accepted Event under Consume. Any other
             // fence stays, because an offer of it would fail the contact.
             if !min_send_remaining.is_zero()
-                && fence.reason == CustodyRetirementReason::Expired
+                && fence.reason == Some(CustodyRetirementReason::Expired)
                 && fence.object.class() == CustodyObjectClass::Event
                 && policy.effective_mode(&fence.topic, &fence.scope)
                     == Some(EventSubscriptionMode::Consume)
@@ -64164,6 +64170,135 @@ mod tests {
         )
         .await;
         assert_eq!(sent.event_page_entries_sent, 0);
+        for node in [source, receiver] {
+            drop(node.store);
+            fs::remove_dir_all(node.state).expect("baseline cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rebooted_node_is_not_offered_what_it_holds() {
+        let scope = Scope::new("test/withheld-offer").expect("scope");
+        let topic = Topic::new("telemetry").expect("topic");
+        let rebooted = [0x8e; 16];
+        for receiver_serves in [false, true] {
+            let (source, receiver) = baseline_test_pair(
+                &format!("withheld-offer-{receiver_serves}"),
+                0x8d,
+                &scope,
+                &topic,
+                EventSubscriptionMode::Consume,
+            );
+            let event = publish_baseline_test_event(&source, &topic, &scope);
+            let (_, received) = baseline_test_contact(
+                source.at(0),
+                receiver.at(0),
+                receiver_serves,
+                BASELINE_TEST_MARGIN,
+            )
+            .await;
+            assert_eq!(received.event_page_inserts, 1);
+
+            let clock = NodeCustodyClock::injected(rebooted, 0, 0);
+            drive_custody_maintenance(&receiver.store, &clock, &[]).expect("reboot maintenance");
+            let status = || {
+                receiver
+                    .store
+                    .custody_age_status(
+                        CustodyObjectKey::event(event.transfer_id),
+                        Some(clock.sample().expect("sample")),
+                    )
+                    .expect("status")
+            };
+            let withheld = Some(aster_redb_store::CustodyAgeStatus::WithheldUnknownAge);
+            assert_eq!(status(), withheld);
+            for contact in 0..2 {
+                let (sent, received) = baseline_test_contact(
+                    source.at(1_000),
+                    receiver.on_clock(rebooted, 1_000),
+                    receiver_serves,
+                    BASELINE_TEST_MARGIN,
+                )
+                .await;
+                assert_eq!(sent.event_page_entries_sent, 0, "contact {contact}");
+                assert_eq!(received.event_page_entries_received, 0, "contact {contact}");
+            }
+
+            // With no margin peers offer it on every contact, as upstream.
+            for _ in 0..2 {
+                let (sent, received) = baseline_test_contact(
+                    source.at(1_000),
+                    receiver.on_clock(rebooted, 1_000),
+                    receiver_serves,
+                    Duration::ZERO,
+                )
+                .await;
+                assert_eq!(sent.event_page_entries_sent, 1);
+                assert_eq!(received.event_page_duplicates, 1);
+                assert_eq!(status(), withheld, "a duplicate can't clear the loss");
+            }
+            for node in [source, receiver] {
+                drop(node.store);
+                fs::remove_dir_all(node.state).expect("baseline cleanup");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_withheld_route_only_row_is_offered_again_only_once_consume_wants_its_content() {
+        let scope = Scope::new("test/withheld-route").expect("scope");
+        let topic = Topic::new("telemetry").expect("topic");
+        let (source, receiver) = baseline_test_pair(
+            "withheld-route",
+            0x92,
+            &scope,
+            &topic,
+            EventSubscriptionMode::Carry,
+        );
+        let event = publish_baseline_test_event(&source, &topic, &scope);
+        baseline_test_contact(source.at(0), receiver.at(0), false, BASELINE_TEST_MARGIN).await;
+        assert_eq!(receiver.store.event_stats().expect("stats").route_cached, 1);
+
+        let rebooted = [0x93; 16];
+        drive_custody_maintenance(
+            &receiver.store,
+            &NodeCustodyClock::injected(rebooted, 1_000, 0),
+            &[],
+        )
+        .expect("reboot maintenance");
+        let contact = |tick_ms| {
+            baseline_test_contact(
+                source.at(tick_ms),
+                receiver.on_clock(rebooted, tick_ms),
+                false,
+                BASELINE_TEST_MARGIN,
+            )
+        };
+        let (sent, _) = contact(1_000).await;
+        assert_eq!(sent.event_page_entries_sent, 0, "Carry has what it wants");
+
+        seed_test_event_subscription(
+            &receiver.store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &scope,
+            b"baseline-consume",
+        );
+        let (sent, received) = contact(2_000).await;
+        assert_eq!(sent.event_page_entries_sent, 1, "Consume wants the content");
+        assert_eq!(received.event_page_inserts, 1);
+        assert!(
+            receiver
+                .store
+                .get_event(event.transfer_id)
+                .expect("Event lookup")
+                .is_some()
+        );
+        let (sent, _) = contact(3_000).await;
+        assert_eq!(
+            sent.event_page_entries_sent, 0,
+            "accepted, and still withheld"
+        );
         for node in [source, receiver] {
             drop(node.store);
             fs::remove_dir_all(node.state).expect("baseline cleanup");

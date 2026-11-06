@@ -42517,6 +42517,84 @@ mod tests {
     }
 
     #[test]
+    fn a_row_withheld_after_a_clock_change_is_a_receiver_fence() {
+        let file = TestFile::new("withheld row receiver fence");
+        let mut services = event_services(0xe2);
+        let store = Store::open_for_mission(&file.0, services.authority).expect("store");
+        let boot = aster_mesh::CustodySample {
+            clock_id: [0xa2; 16],
+            tick_ms: 100,
+        };
+        let transfer = accept_owned_finite_event(&store, &mut services, 1, b"finite", 60, boot);
+        let key = CustodyObjectKey::event(transfer);
+        store
+            .create_event_subscription_with_policy(
+                &store
+                    .test_event_client_context()
+                    .expect("recovered subscription fixture"),
+                &store.control_policy_snapshot().expect("control policy"),
+                &EventSubscriptionKey::new(b"withheld/fences".to_vec()).expect("selector key"),
+                subscription_spec(EventSubscriptionMode::Consume),
+            )
+            .expect("create fence selector");
+        let replication = store
+            .event_replication_policy_snapshot()
+            .expect("replication policy");
+        let fences = |store: &Store| {
+            store
+                .event_receiver_fences_with_policy(&replication, None, MAX_CUSTODY_PAGE)
+                .expect("receiver fences")
+                .into_iter()
+                .map(|fence| (fence.object, fence.reason))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(fences(&store), Vec::new());
+
+        let reboot = aster_mesh::CustodySample {
+            clock_id: [0xb3; 16],
+            tick_ms: 1_000,
+        };
+        assert!(matches!(
+            store
+                .collect_custody_garbage_observed(
+                    Some(reboot),
+                    store
+                        .custody_policy_revision()
+                        .expect("transition revision"),
+                    1,
+                )
+                .into_result(),
+            Err(StoreError::Custody(CustodyStoreError::PolicyChanged))
+        ));
+        assert_eq!(
+            store.custody_age_status(key, Some(reboot)).expect("status"),
+            Some(CustodyAgeStatus::WithheldUnknownAge)
+        );
+        assert_eq!(
+            fences(&store),
+            vec![(key, None)],
+            "a withheld row is fenced but is not retired"
+        );
+
+        // Past its lifetime it retires like any other row.
+        let expired = aster_mesh::CustodySample {
+            clock_id: reboot.clock_id,
+            tick_ms: reboot.tick_ms + 60,
+        };
+        store
+            .collect_custody_garbage(
+                Some(expired),
+                store.custody_policy_revision().expect("expiry revision"),
+                1,
+            )
+            .expect("expire the withheld row");
+        assert_eq!(
+            fences(&store),
+            vec![(key, Some(CustodyRetirementReason::Expired))]
+        );
+    }
+
+    #[test]
     fn custody_lost_age_expires_across_later_domains() {
         let file = TestFile::new("custody lost age expires across later domains");
         let mut services = event_services(0xe1);

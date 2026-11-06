@@ -830,7 +830,8 @@ pub struct CustodyReceiverFence {
     pub scope: Scope,
     pub source_publisher: NodeId,
     pub key_epoch: u64,
-    pub reason: CustodyRetirementReason,
+    /// `None` for a row withheld after a clock change, which is held, not retired.
+    pub reason: Option<CustodyRetirementReason>,
 }
 
 /// Reason a logical payload row entered permanent retirement.
@@ -6084,10 +6085,10 @@ impl Store {
 
     /// Returns an exclusive, class-separated page of receiver-only Event
     /// fences, including both marked retirement awaiting lease drain
-    /// and permanent logical retirement. Current receive policy, interest,
-    /// source revocation, and exact active scope epoch are rechecked in the
-    /// snapshot. These records suppress exact re-offers and are never sender
-    /// inventory.
+    /// and permanent logical retirement, and rows withheld after a clock
+    /// change. Current receive policy, interest, source revocation, and exact
+    /// active scope epoch are rechecked in the snapshot. These records suppress
+    /// exact re-offers and are never sender inventory.
     pub fn event_receiver_fences_with_policy(
         &self,
         policy: &EventReplicationPolicySnapshot,
@@ -6161,7 +6162,7 @@ impl Store {
                     scope: record.scope,
                     source_publisher: record.source_publisher,
                     key_epoch: record.key_epoch,
-                    reason: record.reason,
+                    reason: Some(record.reason),
                 },
             );
             if fences.len() == limit {
@@ -6181,7 +6182,14 @@ impl Store {
             let (key, value) = row?;
             let key = CustodyObjectKey::decode(key.value())?;
             let record = decode_item(value.value())?;
-            if !record.retiring
+            // A row whose age was lost stays withheld until its lifetime ends, and a
+            // duplicate can't clear that, so a peer gains nothing by offering it. A
+            // route-only row under Consume still wants its content.
+            let withheld = record.continuity_lost
+                && !(record.route_only
+                    && policy.effective_mode(&record.topic, &record.scope)
+                        == Some(EventSubscriptionMode::Consume));
+            if !(record.retiring || withheld)
                 || !matches!(
                     key.class,
                     CustodyObjectClass::Event | CustodyObjectClass::RouteEvent
@@ -6206,7 +6214,7 @@ impl Store {
                     "one Event transfer has custody state in both accepted and route namespaces",
                 ));
             }
-            let reason = deferred_retirement_reason(&record);
+            let reason = record.retiring.then(|| deferred_retirement_reason(&record));
             fences.insert(
                 key,
                 CustodyReceiverFence {
