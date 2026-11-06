@@ -25,6 +25,9 @@ Measured on one link between two nodes, with one 10-byte Event:
   of a pair waits one tick more, so the two sides don't collide. Pacing also turns
   off path MTU discovery: its probes are the largest single cost of a connection
   this short, and each contact is a new connection.
+- `ContactExpedite`, through `with_contact_expedite`. An application asks for the
+  shorter `urgent` spacing when it publishes or receives something urgent. Asking on
+  receipt is what speeds an Event up at every hop.
 - `MutableSourceInterests::event_only`. Contacts end after Event transfer and
   skip the State, Record, Blob and Event-bridge lanes, which cost round trips on
   every contact even with nothing to move.
