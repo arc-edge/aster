@@ -8391,7 +8391,11 @@ mod tests {
     }
 
     /// Two members of one mission with a table holding both credentials.
-    fn table_members() -> (ProvisioningBundle, ProvisioningBundle, Arc<MissionCredentialTable>) {
+    fn table_members() -> (
+        ProvisioningBundle,
+        ProvisioningBundle,
+        Arc<MissionCredentialTable>,
+    ) {
         let mut provisioner = ReferenceProvisioner::from_seed([7; 32])
             .unwrap_or_else(|error| panic!("provisioner failed: {error}"));
         let mut issue = |serial| {
@@ -8446,7 +8450,8 @@ mod tests {
     fn a_compact_envelope_fails_closed_without_the_publishers_table_entry() {
         let (first, second, table) = table_members();
         let compact = sealed_by(&mut service(first.with_credential_table(table)));
-        let copy = ProvisioningBundle::from_bytes(&second.to_bytes().expect("bytes")).expect("copy");
+        let copy =
+            ProvisioningBundle::from_bytes(&second.to_bytes().expect("bytes")).expect("copy");
         // No table at all, then a table that lacks this publisher.
         assert!(service(second).inspect(&compact.bytes).is_err());
         let empty = Arc::new(MissionCredentialTable::default());
@@ -8463,7 +8468,9 @@ mod tests {
         // it is a body with a forged authority signature. That must fail in the
         // same credential check an inline credential goes through.
         let (first, second, table) = table_members();
-        let compact = sealed_by(&mut service(first.with_credential_table(Arc::clone(&table))));
+        let compact = sealed_by(&mut service(
+            first.with_credential_table(Arc::clone(&table)),
+        ));
         let mut forged = (*table).clone();
         for (_, signature) in forged.entries.values_mut() {
             signature.ml_dsa_65.as_mut().expect("ml-dsa signature")[0] ^= 1;
@@ -8479,17 +8486,20 @@ mod tests {
     fn a_table_shrinks_the_handshake_and_mutual_authentication_still_completes() {
         let (first, second, table) = table_members();
         let (first_id, second_id) = (bundle_identity(&first), bundle_identity(&second));
-        let (initiator, flight_one) = ReferenceSessionInitiator::start(
-            first.with_credential_table(Arc::clone(&table)),
-        )
-        .expect("start");
+        let (initiator, flight_one) =
+            ReferenceSessionInitiator::start(first.with_credential_table(Arc::clone(&table)))
+                .expect("start");
         let responder =
             ReferenceSessionResponder::open(second.with_credential_table(table)).expect("open");
         let (pending, flight_two) = responder.receive_client(&flight_one).expect("client");
-        let (initiator_pending, flight_three) = initiator.receive_server(&flight_two).expect("server");
+        let (initiator_pending, flight_three) =
+            initiator.receive_server(&flight_two).expect("server");
         assert!(flight_two.len() + flight_three.len() < 12_000);
-        let (responder_session, flight_four) = pending.receive_client_auth(&flight_three).expect("auth");
-        let initiator_session = initiator_pending.receive_finished(&flight_four).expect("finished");
+        let (responder_session, flight_four) =
+            pending.receive_client_auth(&flight_three).expect("auth");
+        let initiator_session = initiator_pending
+            .receive_finished(&flight_four)
+            .expect("finished");
         assert_eq!(responder_session.peer_identity(), first_id);
         assert_eq!(initiator_session.peer_identity(), second_id);
     }

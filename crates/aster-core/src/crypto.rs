@@ -31,16 +31,16 @@ pub use profile::{
 
 #[cfg(feature = "fuzzing")]
 pub use reference::fuzz_reference_v9_session_pair;
+pub use reference::{
+    MissionCredentialTable, ProvisioningAccess, ProvisioningBundle,
+    REFERENCE_SESSION_FRAME_OVERHEAD_BYTES, ReferenceAuthenticatedSession, ReferenceEnvelopeSealer,
+    ReferenceProvisioner, ReferenceSessionAwaitingFinished, ReferenceSessionInitiator,
+    ReferenceSessionResponder, ReferenceSessionResponderPending, ScopeRekeyPlan,
+    ScopeRekeyRecipient,
+};
 pub(crate) use reference::{
     PendingBatchItem, VerifiedBatchItem, VerifiedBatchProof, VerifiedBridgeAuthorization,
     VerifiedBridgeSourceRoute, VerifiedBridgeWrapper,
-};
-pub use reference::{
-    MissionCredentialTable, ProvisioningAccess, ProvisioningBundle,
-    REFERENCE_SESSION_FRAME_OVERHEAD_BYTES,
-    ReferenceAuthenticatedSession, ReferenceEnvelopeSealer, ReferenceProvisioner,
-    ReferenceSessionAwaitingFinished, ReferenceSessionInitiator, ReferenceSessionResponder,
-    ReferenceSessionResponderPending, ScopeRekeyPlan, ScopeRekeyRecipient,
 };
 #[cfg(feature = "sqlite-store")]
 pub use reference::{ReferenceNode, open_reference_node};

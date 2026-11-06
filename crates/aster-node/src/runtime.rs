@@ -1679,8 +1679,9 @@ pub struct ContactPacing {
     /// may lack. The Event stays armed, so one contact carries all that arrived
     /// during the wait.
     pub news: Duration,
-    /// Time between contacts with no known news. These are what repair anything
-    /// a failed contact left behind, so this bounds how long that can last.
+    /// Time between contacts with no known news, and with a peer whose last
+    /// contact failed at the carrier. These repair anything a failed contact left
+    /// behind and find a peer back in range, so this bounds how long those last.
     pub idle: Duration,
 }
 
@@ -17479,6 +17480,8 @@ async fn run_node_actor_inner(
     let zeroization_control = LocalZeroizationControl::bind_pinned(&state_root.path, &store_path)?;
     let endpoint_config = EndpointConfig {
         extra_bind: forwarding.extra_bind,
+        // Pacing means contacts are expensive, and each one is a new connection.
+        fixed_mtu: forwarding.contact_pacing.is_some(),
         ..EndpointConfig::direct(config.bind)
     };
     let endpoint = match &forwarding.controlled_relay {
@@ -17905,6 +17908,9 @@ async fn run_node_actor_inner(
     let mut collision_aborted_outbound = BTreeSet::<TaskId>::new();
     let non_preferred_fallback_delay = non_preferred_contact_fallback_delay(config.sync_interval);
     let contact_pacing = forwarding.contact_pacing;
+    // Peers whose last outbound contact failed at the carrier. With pacing they
+    // wait the idle period, so a node doesn't spend the link on a peer out of range.
+    let mut unreachable_peers = BTreeSet::<EndpointId>::new();
     let contact_election_started = Instant::now();
     let mut peer_contact_activity = configured_peers
         .iter()
@@ -18569,7 +18575,8 @@ async fn run_node_actor_inner(
                     if let (Some(pacing), Some(last)) =
                         (contact_pacing, peer_contact_activity.get(&peer_id))
                         && pacing.defers(
-                            event_contact_wake.bypasses_fallback(peer_id),
+                            event_contact_wake.bypasses_fallback(peer_id)
+                                && !unreachable_peers.contains(&peer_id),
                             local_id < peer_id,
                             config.sync_interval,
                             election_now.saturating_duration_since(*last),
@@ -18943,6 +18950,7 @@ async fn run_node_actor_inner(
                 }
                 match completed {
                     Some(Ok((_task, (peer, Ok(server_receipt))))) => {
+                        unreachable_peers.remove(&peer);
                         if let Some(last_activity) = peer_contact_activity.get_mut(&peer) {
                             *last_activity = Instant::now();
                         }
@@ -19118,6 +19126,7 @@ async fn run_node_actor_inner(
                 }
                 match completed {
                     Some(Ok((task, (peer, Ok(peer_receipt))))) => {
+                        unreachable_peers.remove(&peer.carrier());
                         outbound_peers.remove(&peer.carrier());
                         outbound_abort_handles.remove(&peer.carrier());
                         collision_aborted_outbound.remove(&task);
@@ -19201,6 +19210,9 @@ async fn run_node_actor_inner(
                         );
                     }
                     Some(Ok((task, (peer, Err(error))))) => {
+                        if matches!(error, NodeError::Carrier(_)) {
+                            unreachable_peers.insert(peer.carrier());
+                        }
                         outbound_peers.remove(&peer.carrier());
                         outbound_abort_handles.remove(&peer.carrier());
                         collision_aborted_outbound.remove(&task);
@@ -19688,7 +19700,10 @@ async fn connect_with_fallback(
     address: SocketAddr,
     fallback: Option<SocketAddr>,
 ) -> Result<aster_iroh::Connection, CarrierError> {
-    match (endpoint.connect(ExpectedPeer { id, address }).await, fallback) {
+    match (
+        endpoint.connect(ExpectedPeer { id, address }).await,
+        fallback,
+    ) {
         (Err(_), Some(address)) => endpoint.connect(ExpectedPeer { id, address }).await,
         (connected, _) => connected,
     }

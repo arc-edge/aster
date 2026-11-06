@@ -21,8 +21,10 @@ Measured on one link between two nodes, with one 10-byte Event:
 - `SelectedForwardingConfig::with_contact_pacing`. A new Event starts a contact
   at once upstream, so a steady publisher pays a full contact per Event. Pacing
   batches news behind a minimum interval, and a link with no news stays quiet
-  for a longer one. The higher identity of a pair waits one tick more, so the
-  two sides don't collide.
+  for a longer one, as does a peer whose last contact failed. The higher identity
+  of a pair waits one tick more, so the two sides don't collide. Pacing also turns
+  off path MTU discovery: its probes are the largest single cost of a connection
+  this short, and each contact is a new connection.
 - `MutableSourceInterests::event_only`. Contacts end after Event transfer and
   skip the State, Record, Blob and Event-bridge lanes, which cost round trips on
   every contact even with nothing to move.

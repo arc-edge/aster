@@ -598,6 +598,11 @@ pub struct EndpointConfig {
     pub bind: SocketAddr,
     /// Optional socket on a second network.
     pub extra_bind: Option<ExtraBind>,
+    /// Skips path MTU discovery. It sends near-MTU probes in both directions at
+    /// the start of every connection, which only pays back on a long-lived one.
+    /// Where each contact is a new, short connection on a narrow link they are
+    /// the largest single cost, and 1,200 bytes is safe on any path.
+    pub fixed_mtu: bool,
     /// Bound for establishing or accepting an authenticated connection.
     pub connect_timeout: Duration,
     /// Bound for one opaque request/response exchange.
@@ -612,6 +617,7 @@ impl EndpointConfig {
         Self {
             bind,
             extra_bind: None,
+            fixed_mtu: false,
             connect_timeout: Duration::from_secs(10),
             exchange_timeout: Duration::from_secs(10),
             max_exchange_bytes: DEFAULT_MAX_EXCHANGE_BYTES,
@@ -1452,6 +1458,9 @@ impl Endpoint {
             transport = transport
                 .keep_alive_interval(keepalive_interval)
                 .default_path_keep_alive_interval(keepalive_interval);
+        }
+        if config.fixed_mtu {
+            transport = transport.mtu_discovery_config(None);
         }
         let transport = transport
             .max_concurrent_bidi_streams(VarInt::from_u32(16))
@@ -3561,6 +3570,22 @@ mod tests {
         (server, client, server_connection, client_connection)
     }
 
+    #[tokio::test]
+    async fn a_fixed_mtu_connection_carries_a_frame_larger_than_one_datagram() {
+        let mut config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+        config.fixed_mtu = true;
+        let (_server, _client, server, client) = direct_connection_pair_with_config(config).await;
+        let frame = vec![7u8; 16 * 1024];
+        let echo = tokio::spawn(async move {
+            server
+                .respond_once(|request| Ok((request.to_vec(), true)))
+                .await
+                .expect("respond")
+        });
+        assert_eq!(client.request(&frame).await.expect("request"), frame);
+        echo.await.expect("server task");
+    }
+
     #[test]
     fn an_extra_bind_serves_only_its_subnet() {
         let tailnet = ExtraBind {
@@ -3598,7 +3623,10 @@ mod tests {
         assert!(main.iter().all(SocketAddr::is_ipv4), "{main:?}");
         let extra = server.extra.as_ref().expect("extra endpoint");
         let extra_sockets = extra.inner.bound_sockets();
-        assert!(extra_sockets.iter().all(SocketAddr::is_ipv6), "{extra_sockets:?}");
+        assert!(
+            extra_sockets.iter().all(SocketAddr::is_ipv6),
+            "{extra_sockets:?}"
+        );
 
         let allowed = BTreeSet::from([client.id()]);
         let accepted = {
@@ -3612,7 +3640,10 @@ mod tests {
             })
             .await
             .expect("connect on the extra network");
-        let accepted = accepted.await.expect("join").expect("accept on the extra network");
+        let accepted = accepted
+            .await
+            .expect("join")
+            .expect("accept on the extra network");
         assert_eq!(connection.remote_id(), server.id());
         assert_eq!(accepted.remote_id(), client.id());
     }
