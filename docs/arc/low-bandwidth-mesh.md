@@ -53,11 +53,12 @@ Measured on one link between two nodes, with one 10-byte Event:
   range: a byte model gave 960 kB per contact in the second hour of a mission against
   1.3 kB with no fences. No peer schedules an Event that close to expiry, so with this
   set its fence stays out. A late offer of an accepted Event under Consume lands as a
-  duplicate. An offer that meets a route-only fence, or any fence under Carry, would
-  fail the contact, so those stay in. So do quota fences, because peers still hold
-  those Events. Every fence counts against a store's lifetime limit of 262,144 Events,
-  live rows included. Past it a node refuses new Events, and a contact carrying one
-  fails.
+  duplicate. An offer fails the contact on an accepted Event under Carry and on a
+  route-only one under Consume, so those fences stay in. A route-only fence under Carry
+  stays in too, though an offer of it lands as a duplicate. So do quota fences, because
+  peers still hold those Events. Every fence counts against a store's lifetime limit
+  of 262,144 Events, live rows included. Past it a node refuses new Events, and a
+  contact carrying one fails.
 
   A reboot changes the custody clock, so a finite row loses its age for good and is
   withheld until its lifetime ends. It sat in neither set, so every peer sent it again

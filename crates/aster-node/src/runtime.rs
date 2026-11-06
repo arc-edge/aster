@@ -11980,9 +11980,10 @@ fn transfer_inventory_for_receiver(
             }
             // With a send margin no peer schedules an Event at the end of its life,
             // so an expired one's fence suppresses nothing, and in the baseline it
-            // would keep this set different from every sender's. A late offer lands
-            // as a duplicate only on an accepted Event under Consume. Any other
-            // fence stays, because an offer of it would fail the contact.
+            // would keep this set different from every sender's. A late offer of an
+            // accepted Event under Consume lands as a duplicate. Other fences stay: an
+            // offer fails the contact on an accepted Event under Carry and on a
+            // route-only one under Consume.
             if !min_send_remaining.is_zero()
                 && fence.reason == Some(CustodyRetirementReason::Expired)
                 && fence.object.class() == CustodyObjectClass::Event
