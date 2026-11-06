@@ -1558,8 +1558,9 @@ impl Endpoint {
     }
 
     /// The next inbound connection on either network, or `None` once either has
-    /// stopped. Carrying on with the other would leave a network silently dead,
-    /// and a restart rebinds both.
+    /// stopped. Carrying on with the other would leave a network silently dead. A
+    /// restart fails until the main address is back, and comes up without an extra
+    /// one that is gone.
     async fn next_incoming(&self) -> Option<iroh::endpoint::Incoming> {
         match &self.extra {
             Some(extra) => tokio::select! {
