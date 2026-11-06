@@ -641,6 +641,9 @@ pub enum CarrierError {
     FrameTooLarge { actual: usize, maximum: usize },
     /// One length-delimited turn exceeded the caller-owned aggregate byte bound.
     TurnTooLarge { actual: u64, maximum: u64 },
+    /// A bound endpoint stopped for good, as when its socket fails. Nothing more
+    /// arrives, and accepting again fails at once, so an accept loop must end.
+    EndpointStopped,
 }
 
 impl fmt::Display for CarrierError {
@@ -662,6 +665,7 @@ impl fmt::Display for CarrierError {
                     "carrier turn is at least {actual} bytes; maximum is {maximum}"
                 )
             }
+            Self::EndpointStopped => formatter.write_str("carrier endpoint stopped accepting"),
         }
     }
 }
@@ -743,7 +747,7 @@ impl InboundAcceptor {
                 incoming = timeout(accept_timeout, endpoint.next_incoming()) => {
                     let incoming = incoming
                         .map_err(|_| CarrierError::Timeout("accept"))?
-                        .ok_or_else(|| CarrierError::Transport("endpoint stopped accepting".into()))?;
+                        .ok_or(CarrierError::EndpointStopped)?;
                     let incoming = if incoming.remote_addr_validated() {
                         incoming
                     } else {
@@ -1553,7 +1557,9 @@ impl Endpoint {
         sockets
     }
 
-    /// The next inbound connection on either network.
+    /// The next inbound connection on either network, or `None` once either has
+    /// stopped. Carrying on with the other would leave a network silently dead,
+    /// and a restart rebinds both.
     async fn next_incoming(&self) -> Option<iroh::endpoint::Incoming> {
         match &self.extra {
             Some(extra) => tokio::select! {
@@ -1943,7 +1949,7 @@ impl Endpoint {
         let incoming = timeout(self.config.connect_timeout, self.next_incoming())
             .await
             .map_err(|_| CarrierError::Timeout("accept"))?
-            .ok_or_else(|| CarrierError::Transport("endpoint stopped accepting".into()))?;
+            .ok_or(CarrierError::EndpointStopped)?;
         timeout(self.config.connect_timeout, incoming)
             .await
             .map_err(|_| CarrierError::Timeout("handshake"))?
@@ -3646,6 +3652,35 @@ mod tests {
             .expect("accept on the extra network");
         assert_eq!(connection.remote_id(), server.id());
         assert_eq!(accepted.remote_id(), client.id());
+    }
+
+    #[tokio::test]
+    async fn an_acceptor_reports_either_network_stopping() {
+        for extra_stops in [false, true] {
+            let mut config = EndpointConfig::direct("127.0.0.1:0".parse().expect("address"));
+            config.extra_bind = Some(ExtraBind {
+                address: "[::1]:0".parse().expect("address"),
+                prefix_len: 128,
+            });
+            let server = Endpoint::bind(SecretKey::generate(), config)
+                .await
+                .expect("server");
+            let mut acceptor = server.inbound_acceptor(&BTreeSet::new());
+            if extra_stops {
+                let extra = server.extra.as_ref().expect("extra endpoint");
+                extra.inner.close().await;
+            } else {
+                server.inner.close().await;
+            }
+            let stopped = timeout(Duration::from_secs(2), acceptor.accept())
+                .await
+                .expect("a stopped endpoint is reported at once");
+            assert!(
+                matches!(stopped, Err(CarrierError::EndpointStopped)),
+                "extra_stops={extra_stops}"
+            );
+            server.close().await;
+        }
     }
 
     fn uni_deadline() -> tokio::time::Instant {

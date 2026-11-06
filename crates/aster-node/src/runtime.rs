@@ -3915,6 +3915,8 @@ pub struct RunningNode {
     #[cfg(test)]
     bound_sockets: Vec<SocketAddr>,
     #[cfg(test)]
+    endpoint: Endpoint,
+    #[cfg(test)]
     contact_activity: Arc<ContactActivityProbe>,
     selected_events: SelectedEventHandle,
     selected_state: SelectedStateHandle,
@@ -16680,6 +16682,8 @@ async fn start_node_with_shutdown_ownership(
         #[cfg(test)]
         bound_sockets: ready.bound_sockets,
         #[cfg(test)]
+        endpoint: ready.endpoint,
+        #[cfg(test)]
         contact_activity,
         selected_events,
         selected_state,
@@ -17053,6 +17057,8 @@ struct NodeActorChannels {
 
 struct NodeReady {
     bound_sockets: Vec<SocketAddr>,
+    #[cfg(test)]
+    endpoint: Endpoint,
     state_root: PinnedNodeStateRoot,
     #[cfg(feature = "nearby-discovery")]
     nearby_discovery_stop: Option<NearbyDiscoveryControl>,
@@ -17743,6 +17749,8 @@ async fn run_node_actor_inner(
     let owner_ready = ready
         .send(NodeReady {
             bound_sockets,
+            #[cfg(test)]
+            endpoint: endpoint.clone(),
             state_root: state_root.clone(),
             #[cfg(feature = "nearby-discovery")]
             nearby_discovery_stop: nearby_discovery_stop.clone(),
@@ -18053,6 +18061,11 @@ async fn run_node_actor_inner(
                         }
                     }
                     Err(CarrierError::Timeout(_)) => {}
+                    // A stopped endpoint fails every later accept at once.
+                    Err(error @ CarrierError::EndpointStopped) => {
+                        let _ = accepted_sender.send(Err(error)).await;
+                        break;
+                    }
                     Err(error) => {
                         if accepted_sender.send(Err(error)).await.is_err() {
                             break;
@@ -18968,6 +18981,11 @@ async fn run_node_actor_inner(
                         );
                         #[cfg(test)]
                         contact_activity.launched();
+                    }
+                    // Only a new bind recovers, so stop and let the supervisor restart us.
+                    Some(Err(error @ CarrierError::EndpointStopped)) => {
+                        fatal_error = Some(error.into());
+                        break;
                     }
                     Some(Err(error)) => {
                         receipt.contact_errors += 1;
@@ -34631,6 +34649,147 @@ mod tests {
 
         assert!(captured.records().is_empty());
         fs::remove_dir_all(state).expect("cleanup customer-safe state");
+    }
+
+    /// A node with one peer, so that it accepts, and a subscription to poll.
+    async fn accepting_node_with_subscription(
+        label: &str,
+    ) -> (
+        RunningNode,
+        crate::application::SelectedEventHandle,
+        crate::application::EventPollRequest,
+        Arc<CapturedNodeOutput>,
+        PathBuf,
+    ) {
+        let state = root(label);
+        fs::create_dir_all(&state).expect("state root");
+        #[cfg(unix)]
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+            .expect("owner-only state root");
+        let mut missions = issue_missions(2);
+        let peer = missions.pop().expect("peer mission");
+        let local = missions.pop().expect("local mission");
+        let (output, captured) = captured_node_output(NodeOperatorOutputPolicy::Legacy);
+        let node = start_node_with_forwarding_output(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: local.credentials,
+                peers: vec![MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: aster_iroh::SecretKey::generate().public(),
+                        address: SocketAddr::from(([127, 0, 0, 1], 9)),
+                    },
+                    mission: peer.identity,
+                }],
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_secs(60),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default(),
+            output,
+        )
+        .await
+        .expect("start node");
+        let events = node.selected_events();
+        let client = subscription_fixture_client(&events).await;
+        let subscription = events
+            .subscribe(crate::application::EventSubscriptionRequest {
+                client: client.clone(),
+                operation_key: b"accepting-node".to_vec(),
+                topic: Topic::new("opaque").expect("topic"),
+                scope: Scope::new("test/runtime-contact").expect("scope"),
+                include_descendant_scopes: false,
+            })
+            .await
+            .expect("subscribe");
+        let request = crate::application::EventPollRequest {
+            client,
+            subscription: subscription.id,
+            delivery_limit: 8,
+            scan_limit: 8,
+        };
+        (node, events, request, captured, state)
+    }
+
+    #[tokio::test]
+    async fn a_stopped_endpoint_fails_the_node_and_its_commands() {
+        let (node, events, poll, captured, state) =
+            accepting_node_with_subscription("stopped-endpoint").await;
+        events.poll(poll.clone()).await.expect("poll while live");
+
+        node.endpoint.close().await;
+        let error = timeout(Duration::from_secs(10), async {
+            loop {
+                if let Err(error) = events.poll(poll.clone()).await {
+                    return error;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a stopped endpoint must fail application commands");
+        assert_eq!(
+            error.kind(),
+            crate::application::ApplicationErrorKind::StateUnavailable
+        );
+        let stopped = timeout(Duration::from_secs(10), node.shutdown())
+            .await
+            .expect("a failed node must finish shutting down")
+            .expect_err("shutdown reports why the node stopped");
+        assert!(
+            matches!(stopped, NodeError::Carrier(CarrierError::EndpointStopped)),
+            "{stopped:?}"
+        );
+        assert!(
+            !captured
+                .records()
+                .iter()
+                .any(|(_, record)| record.starts_with("CONTACT direction=in")),
+            "a stopped endpoint is not one failed contact after another"
+        );
+        fs::remove_dir_all(state).expect("cleanup state");
+    }
+
+    #[tokio::test]
+    async fn a_refused_connection_leaves_the_node_running() {
+        let (node, events, poll, captured, state) =
+            accepting_node_with_subscription("refused-connection").await;
+        let address = node
+            .bound_sockets
+            .iter()
+            .copied()
+            .find(SocketAddr::is_ipv4)
+            .expect("node IPv4 socket");
+        let stranger = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("stranger bind")),
+        )
+        .await
+        .expect("stranger endpoint");
+        let _ = stranger
+            .connect(ExpectedPeer {
+                id: node.endpoint.id(),
+                address,
+            })
+            .await;
+        timeout(Duration::from_secs(10), async {
+            while !captured.records().iter().any(|(_, record)| {
+                record.starts_with("CONTACT direction=in status=error")
+                    && record.contains("unauthorized")
+            }) {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the actor sees the refused connection");
+
+        events.poll(poll).await.expect("poll after a refused peer");
+        let receipt = node.shutdown().await.expect("clean shutdown");
+        assert!(receipt.contact_errors >= 1);
+        stranger.close().await;
+        fs::remove_dir_all(state).expect("cleanup state");
     }
 
     #[tokio::test]
