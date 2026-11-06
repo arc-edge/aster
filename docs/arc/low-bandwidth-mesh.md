@@ -28,6 +28,12 @@ Measured on one link between two nodes, with one 10-byte Event:
 - `MutableSourceInterests::event_only`. Contacts end after Event transfer and
   skip the State, Record, Blob and Event-bridge lanes, which cost round trips on
   every contact even with nothing to move.
+- `MutableSourceInterests::with_min_send_remaining`. A contact's schedule is exact,
+  so one Event that expires before its page is written aborts the whole contact.
+  After an outage a backlog always holds Events at the end of their lifetime, and
+  on a slow link every retry aborted the same way, so the link never recovered.
+  With this set, an Event with too little life left isn't scheduled. It stays in
+  the difference as unscheduled, which the protocol already allows.
 - `MissionCredentialTable`, through
   `UnprotectedReferenceMission::with_credential_table`. A source envelope and a
   handshake flight carry each member's credential and the authority's signature

@@ -1158,6 +1158,7 @@ pub struct MutableSourceInterests {
     record: Vec<SourceInterestSelector>,
     blob: Vec<SourceInterestSelector>,
     event_only: bool,
+    min_send_remaining: Duration,
 }
 
 impl MutableSourceInterests {
@@ -1169,6 +1170,7 @@ impl MutableSourceInterests {
             record,
             blob: Vec::new(),
             event_only: false,
+            min_send_remaining: Duration::ZERO,
         }
     }
 
@@ -1188,6 +1190,21 @@ impl MutableSourceInterests {
 
     const fn is_event_only(&self) -> bool {
         self.event_only
+    }
+
+    /// Leaves out of a contact's schedule any finite Event with less than this
+    /// long to live.
+    ///
+    /// A schedule is exact: the header commits to its Events and one that expires
+    /// before its page is written aborts the whole contact. On a slow link, a
+    /// backlog after an outage always holds Events at the end of their lifetime,
+    /// so every retry aborts the same way, and the link never recovers. Set this
+    /// above the longest a contact takes from its schedule to its last page. The
+    /// Events left out stay in the difference as unscheduled, which the protocol
+    /// already allows, and they would have expired anyway.
+    pub const fn with_min_send_remaining(mut self, remaining: Duration) -> Self {
+        self.min_send_remaining = remaining;
+        self
     }
 
     /// Adds the explicit Blob source/content selector set.
@@ -11691,6 +11708,7 @@ fn cache_contact_verified_event(
 struct AuthenticatedSenderRouteCandidate {
     claim: AuthenticatedEventRouteClaim,
     acceptance_order: u64,
+    remaining_ms: Option<u64>,
 }
 
 impl std::ops::Deref for AuthenticatedSenderRouteCandidate {
@@ -11802,6 +11820,7 @@ fn cached_sender_route_claims(
         claims.push(AuthenticatedSenderRouteCandidate {
             claim,
             acceptance_order: projection.acceptance_order(),
+            remaining_ms: projection.remaining_ms(),
         });
     }
     Ok(claims)
@@ -20469,6 +20488,12 @@ struct RuntimeLocalEventSendPlan {
     clippy::too_many_arguments,
     reason = "the explicit authorization generations and budgets are independently validated inputs"
 )]
+/// Whether an Event with this much lifetime left should be scheduled. A durable
+/// Event has no limit.
+fn survives_contact(remaining_ms: Option<u64>, min_send_remaining: Duration) -> bool {
+    remaining_ms.is_none_or(|remaining| u128::from(remaining) >= min_send_remaining.as_millis())
+}
+
 fn build_runtime_local_event_send_plan(
     store: &Store,
     event_guard: &EventLaneGuard,
@@ -20483,6 +20508,7 @@ fn build_runtime_local_event_send_plan(
     receiver_interest: &EventInterest,
     selector_generation: u64,
     emission: EmissionPolicySnapshot,
+    min_send_remaining: Duration,
 ) -> Result<RuntimeLocalEventSendPlan, NodeError> {
     let claims = cached_sender_route_claims(store, event_guard.policy(), event_verifier)?;
     let claims: BTreeMap<_, _> = claims
@@ -20510,6 +20536,9 @@ fn build_runtime_local_event_send_plan(
         .iter()
         .filter_map(|id| {
             let claim = claims.get(id)?;
+            if !survives_contact(claim.remaining_ms, min_send_remaining) {
+                return None;
+            }
             Some(AuthenticatedEventMetadata {
                 id: *id,
                 acceptance_order: claim.acceptance_order,
@@ -28585,6 +28614,7 @@ async fn sync_authenticated_session(
         to_responder_lane.receiver_interest,
         to_responder_lane.receiver_selector_revision.value(),
         local_emission,
+        mutable_interests.min_send_remaining,
     )?;
     record_local_event_plan(&mut receipt, &local_plan.built.plan)?;
     let remote_plan = sync_event_turn_plans(
@@ -30955,6 +30985,7 @@ async fn serve_session(
         to_initiator_lane.receiver_interest,
         to_initiator_lane.receiver_selector_revision.value(),
         local_emission,
+        mutable_interests.min_send_remaining,
     )?;
     record_local_event_plan(&mut receipt, &local_plan.built.plan)?;
     let remote_plan = serve_event_turn_plans(
@@ -34685,6 +34716,16 @@ mod tests {
         ] {
             assert_eq!(parse_linux_boot_id(malformed), None, "{malformed:?}");
         }
+    }
+
+    #[test]
+    fn an_event_near_expiry_is_left_out_of_a_schedule_and_a_durable_one_never_is() {
+        let margin = Duration::from_secs(30);
+        assert!(!survives_contact(Some(29_999), margin));
+        assert!(survives_contact(Some(30_000), margin));
+        assert!(survives_contact(None, margin));
+        // With no margin set, nothing changes.
+        assert!(survives_contact(Some(1), Duration::ZERO));
     }
 
     #[test]

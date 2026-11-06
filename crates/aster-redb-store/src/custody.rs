@@ -635,6 +635,15 @@ impl CustodySenderProjection {
         self.object
     }
 
+    /// Lifetime left at the sample this projection was taken with, for a finite
+    /// row. `None` means the row has no finite lifetime.
+    pub const fn remaining_ms(&self) -> Option<u64> {
+        match self.status {
+            CustodyAgeStatus::Forwardable { remaining_ms, .. } => Some(remaining_ms),
+            _ => None,
+        }
+    }
+
     pub const fn semantic_id(&self) -> [u8; 32] {
         self.semantic_id
     }
