@@ -34789,27 +34789,37 @@ mod tests {
         )
         .await
         .expect("stranger endpoint");
-        let _ = stranger
-            .connect(ExpectedPeer {
-                id: node.endpoint.id(),
-                address,
+        let refused = || {
+            captured
+                .records()
+                .iter()
+                .filter(|(_, record)| {
+                    record.starts_with("CONTACT direction=in status=error")
+                        && record.contains("unauthorized")
+                })
+                .count()
+        };
+        // The second one shows the acceptor outlived the first.
+        for want in 1..=2 {
+            let _ = stranger
+                .connect(ExpectedPeer {
+                    id: node.endpoint.id(),
+                    address,
+                })
+                .await;
+            timeout(Duration::from_secs(10), async {
+                while refused() < want {
+                    sleep(Duration::from_millis(5)).await;
+                }
             })
-            .await;
-        timeout(Duration::from_secs(10), async {
-            while !captured.records().iter().any(|(_, record)| {
-                record.starts_with("CONTACT direction=in status=error")
-                    && record.contains("unauthorized")
-            }) {
-                sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the actor sees the refused connection");
+            .await
+            .expect("the actor sees the refused connection");
+        }
 
         events.poll(poll).await.expect("poll after a refused peer");
         let activity = node.contact_activity.clone();
         let receipt = node.shutdown().await.expect("clean shutdown");
-        assert!(receipt.contact_errors >= 1);
+        assert!(receipt.contact_errors >= 2);
         assert_eq!(activity.endpoint_closes.load(Ordering::Relaxed), 1);
         stranger.close().await;
         fs::remove_dir_all(state).expect("cleanup state");

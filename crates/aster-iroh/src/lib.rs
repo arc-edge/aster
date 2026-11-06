@@ -3679,6 +3679,13 @@ mod tests {
                 matches!(stopped, Err(CarrierError::EndpointStopped)),
                 "extra_stops={extra_stops}"
             );
+            assert!(
+                matches!(
+                    server.accept(&BTreeSet::new()).await,
+                    Err(CarrierError::EndpointStopped)
+                ),
+                "extra_stops={extra_stops}"
+            );
             server.close().await;
         }
     }
