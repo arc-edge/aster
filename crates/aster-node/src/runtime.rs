@@ -93,6 +93,7 @@ use aster_redb_store::{
     StoredBlob, StoredControl, StoredControlEffect, StoredEvent, StoredEventTransfer, StoredRecord,
     StoredState, TransferLease, ZeroizationArtifact, ZeroizationIntent, ZeroizationStore,
 };
+use aster_redb_store::{CustodyObjectClass, CustodyRetirementReason};
 use sha2::{Digest as _, Sha256};
 #[cfg(unix)]
 use tokio::{
@@ -1202,6 +1203,10 @@ impl MutableSourceInterests {
     /// above the longest a contact takes from its schedule to its last page. The
     /// Events left out stay in the difference as unscheduled, which the protocol
     /// already allows, and they would have expired anyway.
+    ///
+    /// Since no peer then schedules an Event at the end of its life, the fence an
+    /// expired Event leaves also stays out of this node's reconciliation baseline,
+    /// so the baseline matches what peers offer.
     pub const fn with_min_send_remaining(mut self, remaining: Duration) -> Self {
         self.min_send_remaining = remaining;
         self
@@ -7140,6 +7145,7 @@ struct DirectedEventLane<'a> {
     receiver_interest: &'a EventInterest,
     receiver_selector_revision: CustodyPeerSelectorRevision,
     direction: EventDirection,
+    min_send_remaining: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -11913,6 +11919,7 @@ fn transfer_inventory_for_receiver(
     verifier: &mut ReferenceEnvelopeSealer,
     receiver_interest: &EventInterest,
     allow_finite_ttl: bool,
+    min_send_remaining: Duration,
 ) -> Result<InventorySnapshot, NodeError> {
     if receiver_interest.is_empty() {
         return Ok(InventorySnapshot::default());
@@ -11953,6 +11960,19 @@ fn transfer_inventory_for_receiver(
                 continue;
             }
             if !verifier.can_route_event(&fence.scope, fence.key_epoch) {
+                continue;
+            }
+            // With a send margin no peer schedules an Event at the end of its life,
+            // so an expired one's fence suppresses nothing, and in the baseline it
+            // would keep this set different from every sender's. A late offer lands
+            // as a duplicate only on an accepted Event under Consume. Any other
+            // fence stays, because an offer of it would fail the contact.
+            if !min_send_remaining.is_zero()
+                && fence.reason == CustodyRetirementReason::Expired
+                && fence.object.class() == CustodyObjectClass::Event
+                && policy.effective_mode(&fence.topic, &fence.scope)
+                    == Some(EventSubscriptionMode::Consume)
+            {
                 continue;
             }
             // Retirement is a permanent exact-transfer fence. A later
@@ -20353,6 +20373,7 @@ async fn sync_event_reconciliation_lane(
         receiver_interest,
         receiver_selector_revision: _,
         direction,
+        min_send_remaining,
     } = lane;
     event_guard.check(store)?;
     let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
@@ -20376,6 +20397,7 @@ async fn sync_event_reconciliation_lane(
             event_verifier,
             receiver_interest,
             allow_finite_ttl,
+            min_send_remaining,
         )?,
     };
     let limits = selected_reconciliation_limits()?;
@@ -22837,6 +22859,7 @@ async fn sync_event_transfer_lane_inner(
         receiver_interest,
         receiver_selector_revision,
         direction,
+        min_send_remaining: _,
     } = lane;
     let authenticated_peer = mission.peer().mission_id();
     let peer_route_commitments = mission.peer_route_grant_commitments().to_vec();
@@ -28389,6 +28412,7 @@ async fn sync_authenticated_session(
         receiver_interest: &peer_interest.interest,
         receiver_selector_revision: peer_interest.selector_revision,
         direction: EventDirection::ToSessionResponder,
+        min_send_remaining: mutable_interests.min_send_remaining,
     };
     let to_responder = match sync_event_reconciliation_lane(
         store,
@@ -28488,6 +28512,7 @@ async fn sync_authenticated_session(
             receiver_interest: &local_interest.interest,
             receiver_selector_revision: local_interest.selector_revision,
             direction: EventDirection::ToSessionInitiator,
+            min_send_remaining: mutable_interests.min_send_remaining,
         };
         let to_initiator = match sync_event_reconciliation_lane(
             store,
@@ -28568,6 +28593,7 @@ async fn sync_authenticated_session(
         receiver_interest: &local_interest.interest,
         receiver_selector_revision: local_interest.selector_revision,
         direction: EventDirection::ToSessionInitiator,
+        min_send_remaining: mutable_interests.min_send_remaining,
     };
     let to_initiator = if matches!(remote_emission.policy, EventEmissionPolicy::ReceiveOnly) {
         None
@@ -29270,6 +29296,7 @@ async fn serve_event_reconciliation_lane(
         receiver_interest,
         receiver_selector_revision: _,
         direction,
+        min_send_remaining,
     } = lane;
     event_guard.check(store)?;
     let emission = contact_policy_or_normal()?;
@@ -29288,6 +29315,7 @@ async fn serve_event_reconciliation_lane(
                 event_verifier,
                 receiver_interest,
                 allow_finite_ttl,
+                min_send_remaining,
             )?,
             EventDirection::ToSessionInitiator => transfer_inventory_for_peer(
                 store,
@@ -29532,6 +29560,7 @@ async fn serve_event_transfer_lane_inner(
         receiver_interest,
         receiver_selector_revision,
         direction,
+        min_send_remaining: _,
     } = lane;
     let emission = contact_policy_or_normal()?;
     let semantic_v3 = mission.semantic_version() >= MIN_CUSTODY_SEMANTIC_VERSION;
@@ -30764,6 +30793,7 @@ async fn serve_session(
         receiver_interest: &local_interest.interest,
         receiver_selector_revision: local_interest.selector_revision,
         direction: EventDirection::ToSessionResponder,
+        min_send_remaining: mutable_interests.min_send_remaining,
     };
     let to_responder = match serve_event_reconciliation_lane(
         &store,
@@ -30862,6 +30892,7 @@ async fn serve_session(
             receiver_interest: &peer_interest.interest,
             receiver_selector_revision: peer_interest.selector_revision,
             direction: EventDirection::ToSessionInitiator,
+            min_send_remaining: mutable_interests.min_send_remaining,
         };
         let to_initiator = match serve_event_reconciliation_lane(
             &store,
@@ -30941,6 +30972,7 @@ async fn serve_session(
         receiver_interest: &peer_interest.interest,
         receiver_selector_revision: peer_interest.selector_revision,
         direction: EventDirection::ToSessionInitiator,
+        min_send_remaining: mutable_interests.min_send_remaining,
     };
     let to_initiator = if matches!(local_emission.policy, EventEmissionPolicy::ReceiveOnly) {
         None
@@ -37100,6 +37132,7 @@ mod tests {
                                 &mut verifier,
                                 &interest,
                                 true,
+                                Duration::ZERO,
                             )
                             .expect("cached receiver lane")
                             .len(),
@@ -37132,6 +37165,7 @@ mod tests {
                             &mut verifier,
                             &interest,
                             true,
+                            Duration::ZERO,
                         )
                         .expect("one cache miss is repaired")
                         .len(),
@@ -62101,6 +62135,7 @@ mod tests {
                 &mut server_sealer,
                 &beta_interest,
                 true,
+                Duration::ZERO,
             )
             .expect("beta-filtered inventory"),
             InventorySnapshot::new(
@@ -62116,6 +62151,7 @@ mod tests {
                 &mut server_sealer,
                 &EventInterest::empty(),
                 true,
+                Duration::ZERO,
             )
             .expect("empty inventory")
             .is_empty(),
@@ -63654,6 +63690,483 @@ mod tests {
         drop(consumer_store);
         for state in [source_state, relay_state, consumer_state] {
             fs::remove_dir_all(state).expect("route-forward cleanup");
+        }
+    }
+
+    /// One member of a mission for the tests of what a receiver's baseline holds.
+    struct BaselineTestNode {
+        store: Arc<Store>,
+        mission: UnprotectedReferenceMission,
+        clock_id: [u8; 16],
+        state: PathBuf,
+    }
+
+    impl BaselineTestNode {
+        fn at(&self, tick_ms: u64) -> TestForwardingNode {
+            self.on_clock(self.clock_id, tick_ms)
+        }
+
+        fn on_clock(&self, clock_id: [u8; 16], tick_ms: u64) -> TestForwardingNode {
+            TestForwardingNode {
+                store: self.store.clone(),
+                mission: self.mission.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(clock_id, tick_ms, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            }
+        }
+
+        fn expire_to(&self, tick_ms: u64) {
+            let report = self
+                .store
+                .collect_custody_garbage(
+                    Some(CustodySample {
+                        clock_id: self.clock_id,
+                        tick_ms,
+                    }),
+                    self.store
+                        .custody_policy_revision()
+                        .expect("policy revision"),
+                    MAX_CUSTODY_PAGE,
+                )
+                .expect("expire custody");
+            assert!(!report.retired.is_empty(), "nothing expired at {tick_ms}");
+        }
+    }
+
+    fn baseline_test_pair(
+        label: &str,
+        seed: u8,
+        scope: &Scope,
+        topic: &Topic,
+        receiver_mode: EventSubscriptionMode,
+    ) -> (BaselineTestNode, BaselineTestNode) {
+        let access = ProvisioningAccess::member(scope.clone(), vec![1], vec![topic.clone()])
+            .expect("baseline access");
+        let mut provisioner =
+            ReferenceProvisioner::from_seed([seed; 32]).expect("baseline provisioner");
+        let [source, receiver] = [1, 2].map(|index| {
+            let mission = UnprotectedReferenceMission::from_bytes(
+                provisioner
+                    .issue_node(index, std::slice::from_ref(&access))
+                    .and_then(|bundle| bundle.to_bytes())
+                    .expect("baseline bundle"),
+            )
+            .expect("baseline mission");
+            let state = root(&format!("{label}-{index}"));
+            fs::create_dir_all(&state).expect("baseline state");
+            let store = Arc::new(
+                Store::open_for_mission(state.join(STORE_FILE), mission.mission_authority_id())
+                    .expect("baseline store"),
+            );
+            BaselineTestNode {
+                store,
+                mission,
+                clock_id: [seed.wrapping_add(index as u8); 16],
+                state,
+            }
+        });
+        seed_test_event_subscription(
+            &receiver.store,
+            receiver_mode,
+            topic,
+            scope,
+            b"baseline-receive",
+        );
+        (source, receiver)
+    }
+
+    /// Runs one contact with `margin` set on both nodes and returns the receipts of
+    /// the node sending the Event and the node receiving it.
+    async fn baseline_test_contact(
+        source: TestForwardingNode,
+        receiver: TestForwardingNode,
+        receiver_serves: bool,
+        margin: Duration,
+    ) -> (PeerReceipt, PeerReceipt) {
+        let interests = MutableSourceInterests::default().with_min_send_remaining(margin);
+        let (server, client) = if receiver_serves {
+            (receiver, source)
+        } else {
+            (source, receiver)
+        };
+        let (client, server, _, _) =
+            contact_test_pair_with_forwarding_results_tracked_and_interests(
+                server,
+                client,
+                interests.clone(),
+                interests,
+            )
+            .await;
+        let (client, server) = (
+            client.expect("client contact").receipt,
+            server.expect("server contact").receipt,
+        );
+        if receiver_serves {
+            (client, server)
+        } else {
+            (server, client)
+        }
+    }
+
+    const BASELINE_TEST_TTL_MS: u64 = 100_000;
+    const BASELINE_TEST_MARGIN: Duration = Duration::from_secs(30);
+
+    fn publish_baseline_test_event(
+        source: &BaselineTestNode,
+        topic: &Topic,
+        scope: &Scope,
+    ) -> StoredEvent {
+        publish_test_custody_event(
+            &source.store,
+            &mut open_test_sealer(&source.mission),
+            TestCustodyPublication {
+                operation: b"baseline/event",
+                topic,
+                scope,
+                priority: Priority::Routine,
+                ttl_ms: Some(BASELINE_TEST_TTL_MS),
+                sample: CustodySample {
+                    clock_id: source.clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"baseline-event",
+                tombstone: false,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn receiver_baseline_drops_expired_fences_only_with_a_send_margin() {
+        let state = root("baseline-expired-fence");
+        fs::create_dir_all(&state).expect("baseline state");
+        let services = control_test_services([0x83; 32]);
+        let store = Store::open_for_mission(
+            state.join(STORE_FILE),
+            services.other.mission_authority_id(),
+        )
+        .expect("baseline store");
+        seed_test_event_subscription(
+            &store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"baseline-consume",
+        );
+        let clock_id = [0x84; 16];
+        let mut verifier = open_test_sealer(&services.other);
+        let mut publish = |operation: &[u8], ttl_ms, tick_ms| {
+            publish_test_custody_event(
+                &store,
+                &mut verifier,
+                TestCustodyPublication {
+                    operation,
+                    topic: &services.topic,
+                    scope: &services.scope,
+                    priority: Priority::Routine,
+                    ttl_ms: Some(ttl_ms),
+                    sample: CustodySample { clock_id, tick_ms },
+                    payload: operation,
+                    tombstone: false,
+                },
+            )
+            .transfer_id
+            .reconciliation_item_id()
+        };
+        let live = publish(b"baseline/live", 1_000_000, 0);
+        let expired = publish(b"baseline/expired", 1_000, 0);
+        store
+            .collect_custody_garbage(
+                Some(CustodySample {
+                    clock_id,
+                    tick_ms: 2_000,
+                }),
+                store.custody_policy_revision().expect("policy revision"),
+                MAX_CUSTODY_PAGE,
+            )
+            .expect("expire one Event");
+
+        let victim = publish(b"baseline/victim", 10_000, 2_000);
+        let revision = store
+            .set_custody_quota(CustodyQuota::global(2, 1_000_000).expect("quota"))
+            .expect("set quota");
+
+        let replication = store
+            .event_replication_policy_snapshot()
+            .expect("replication policy");
+        let interest = exact_event_interest(&services.topic, &services.scope);
+        let mut verifier = open_test_sealer(&services.other);
+        let live_policy = Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal));
+        let guard = ContactEmissionGuard {
+            captured: live_policy.snapshot().expect("emission snapshot"),
+            live: live_policy,
+            custody_clock: NodeCustodyClock::injected(clock_id, 2_000, 0),
+        };
+        CONTACT_EMISSION_GUARD
+            .scope(guard, async {
+                let mut baseline = |margin| {
+                    transfer_inventory_for_receiver(
+                        &store,
+                        &replication,
+                        &mut verifier,
+                        &interest,
+                        true,
+                        margin,
+                    )
+                    .expect("receiver baseline")
+                };
+                assert_eq!(
+                    baseline(BASELINE_TEST_MARGIN),
+                    InventorySnapshot::new([live, victim]),
+                    "with a margin the baseline is the live set"
+                );
+                assert_eq!(
+                    baseline(Duration::ZERO),
+                    InventorySnapshot::new([live, victim, expired]),
+                    "with no margin the fence stays, as upstream"
+                );
+                let report = store
+                    .collect_custody_pressure(
+                        None,
+                        CustodyPressureDemand {
+                            usage: CustodyUsage { items: 1, bytes: 1 },
+                            priority: Priority::Immediate,
+                        },
+                        Some(CustodySample {
+                            clock_id,
+                            tick_ms: 2_000,
+                        }),
+                        revision,
+                        1,
+                    )
+                    .expect("retire under pressure");
+                assert_eq!(report.retired.len(), 1);
+                assert_eq!(
+                    &report.retired[0].transfer_id(),
+                    victim.as_bytes(),
+                    "the nearest expiry goes first"
+                );
+                assert_eq!(
+                    baseline(BASELINE_TEST_MARGIN),
+                    InventorySnapshot::new([live, victim]),
+                    "a pressure fence stays: its Event is live at the peer"
+                );
+                assert_eq!(
+                    baseline(Duration::ZERO),
+                    InventorySnapshot::new([live, victim, expired]),
+                );
+            })
+            .await;
+        drop(store);
+        fs::remove_dir_all(state).expect("baseline cleanup");
+    }
+
+    #[tokio::test]
+    async fn an_offer_of_an_event_fenced_as_expired_lands_as_a_duplicate() {
+        let scope = Scope::new("test/expired-fence-offer").expect("scope");
+        let topic = Topic::new("telemetry").expect("topic");
+        for receiver_serves in [false, true] {
+            let (source, receiver) = baseline_test_pair(
+                &format!("expired-offer-{receiver_serves}"),
+                0x85,
+                &scope,
+                &topic,
+                EventSubscriptionMode::Consume,
+            );
+            let event = publish_baseline_test_event(&source, &topic, &scope);
+            let (_, received) = baseline_test_contact(
+                source.at(0),
+                receiver.at(0),
+                receiver_serves,
+                BASELINE_TEST_MARGIN,
+            )
+            .await;
+            assert_eq!(received.event_page_inserts, 1);
+
+            // The source's own clock leaves it plenty of life: its age lags here.
+            receiver.expire_to(BASELINE_TEST_TTL_MS);
+            let (sent, received) = baseline_test_contact(
+                source.at(1_000),
+                receiver.at(BASELINE_TEST_TTL_MS),
+                receiver_serves,
+                BASELINE_TEST_MARGIN,
+            )
+            .await;
+            assert_eq!(sent.event_page_entries_sent, 1);
+            assert_eq!(received.event_page_duplicates, 1);
+            assert_eq!(received.event_page_inserts, 0);
+            assert!(
+                receiver
+                    .store
+                    .get_event(event.transfer_id)
+                    .expect("Event lookup")
+                    .is_none(),
+                "a late offer must not bring an expired Event back"
+            );
+
+            // With no margin the fence stays in the baseline and nothing is offered.
+            let (sent, _) = baseline_test_contact(
+                source.at(2_000),
+                receiver.at(BASELINE_TEST_TTL_MS),
+                receiver_serves,
+                Duration::ZERO,
+            )
+            .await;
+            assert_eq!(sent.event_page_entries_sent, 0);
+            for node in [source, receiver] {
+                drop(node.store);
+                fs::remove_dir_all(node.state).expect("baseline cleanup");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_offer_of_an_expired_event_still_under_a_lease_lands_as_a_duplicate() {
+        let scope = Scope::new("test/expired-lease-offer").expect("scope");
+        let topic = Topic::new("telemetry").expect("topic");
+        let (source, receiver) = baseline_test_pair(
+            "expired-lease-offer",
+            0x89,
+            &scope,
+            &topic,
+            EventSubscriptionMode::Consume,
+        );
+        let event = publish_baseline_test_event(&source, &topic, &scope);
+        baseline_test_contact(source.at(0), receiver.at(0), false, BASELINE_TEST_MARGIN).await;
+
+        // A send in flight to a third node keeps the row, marked, past its expiry.
+        let revision = receiver.store.custody_policy_revision().expect("revision");
+        let lease = receiver
+            .store
+            .begin_custody_send(
+                source.mission.identity(),
+                CustodyObjectKey::event(event.transfer_id),
+                CustodyPeerSelectorRevision::new(1),
+                Some(CustodySample {
+                    clock_id: receiver.clock_id,
+                    tick_ms: 0,
+                }),
+                1,
+                revision,
+            )
+            .expect("hold the row");
+        let report = receiver
+            .store
+            .collect_custody_garbage(
+                Some(CustodySample {
+                    clock_id: receiver.clock_id,
+                    tick_ms: BASELINE_TEST_TTL_MS,
+                }),
+                revision,
+                MAX_CUSTODY_PAGE,
+            )
+            .expect("mark the row");
+        assert_eq!(report.blocked_by_leases, 1);
+
+        let (sent, received) = baseline_test_contact(
+            source.at(1_000),
+            receiver.at(BASELINE_TEST_TTL_MS),
+            false,
+            BASELINE_TEST_MARGIN,
+        )
+        .await;
+        assert_eq!(sent.event_page_entries_sent, 1);
+        assert_eq!(received.event_page_duplicates, 1);
+        receiver
+            .store
+            .release_transfer_lease(lease.id)
+            .expect("release lease");
+        for node in [source, receiver] {
+            drop(node.store);
+            fs::remove_dir_all(node.state).expect("baseline cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_fence_stays_under_carry_because_an_offer_of_it_would_fail_the_contact() {
+        let scope = Scope::new("test/expired-fence-carry").expect("scope");
+        let topic = Topic::new("telemetry").expect("topic");
+        let (source, receiver) = baseline_test_pair(
+            "expired-fence-carry",
+            0x8b,
+            &scope,
+            &topic,
+            EventSubscriptionMode::Consume,
+        );
+        publish_baseline_test_event(&source, &topic, &scope);
+        baseline_test_contact(source.at(0), receiver.at(0), false, BASELINE_TEST_MARGIN).await;
+        receiver.expire_to(BASELINE_TEST_TTL_MS);
+
+        let client = receiver
+            .store
+            .test_event_client_context()
+            .expect("client context");
+        let policy = receiver.store.control_policy_snapshot().expect("policy");
+        for subscription in receiver.store.list_event_subscriptions().expect("list") {
+            receiver
+                .store
+                .remove_event_subscription_with_policy(&client, &policy, subscription.id)
+                .expect("drop Consume");
+        }
+        seed_test_event_subscription(
+            &receiver.store,
+            EventSubscriptionMode::Carry,
+            &topic,
+            &scope,
+            b"baseline-carry",
+        );
+        let (sent, _) = baseline_test_contact(
+            source.at(1_000),
+            receiver.at(BASELINE_TEST_TTL_MS),
+            false,
+            BASELINE_TEST_MARGIN,
+        )
+        .await;
+        assert_eq!(sent.event_page_entries_sent, 0);
+        for node in [source, receiver] {
+            drop(node.store);
+            fs::remove_dir_all(node.state).expect("baseline cleanup");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_route_only_expired_fence_stays_because_an_offer_of_it_would_fail_the_contact() {
+        let scope = Scope::new("test/expired-route-fence").expect("scope");
+        let topic = Topic::new("telemetry").expect("topic");
+        let (source, receiver) = baseline_test_pair(
+            "expired-route-fence",
+            0x87,
+            &scope,
+            &topic,
+            EventSubscriptionMode::Carry,
+        );
+        publish_baseline_test_event(&source, &topic, &scope);
+        let (_, received) =
+            baseline_test_contact(source.at(0), receiver.at(0), false, BASELINE_TEST_MARGIN).await;
+        assert_eq!(received.event_page_inserts, 1);
+        receiver.expire_to(BASELINE_TEST_TTL_MS);
+
+        // Once Consume dominates, these bytes would verify as content and meet the
+        // route fence, which Event admission reports as an error.
+        seed_test_event_subscription(
+            &receiver.store,
+            EventSubscriptionMode::Consume,
+            &topic,
+            &scope,
+            b"baseline-consume",
+        );
+        let (sent, _) = baseline_test_contact(
+            source.at(1_000),
+            receiver.at(BASELINE_TEST_TTL_MS),
+            false,
+            BASELINE_TEST_MARGIN,
+        )
+        .await;
+        assert_eq!(sent.event_page_entries_sent, 0);
+        for node in [source, receiver] {
+            drop(node.store);
+            fs::remove_dir_all(node.state).expect("baseline cleanup");
         }
     }
 
@@ -66176,6 +66689,7 @@ mod tests {
                 &mut server_sealer,
                 &matching_interest,
                 true,
+                Duration::ZERO,
             )
             .expect("local receiver baseline"),
             InventorySnapshot::new(vec![hidden_id.reconciliation_item_id()]),
