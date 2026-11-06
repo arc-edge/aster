@@ -497,6 +497,7 @@ const MUTABLE_V8_CONTACT_RESERVE_BYTES: usize = MUTABLE_V5_CONTACT_RESERVE_BYTES
 const MUTABLE_V5_CONTACT_RESERVE_EXCHANGES: usize =
     3 + 6 * MUTABLE_LANE_FULL_GUARANTEE_EXCHANGES + 3 + BLOB_CARRIER_CONTACT_RESERVE_EXCHANGES;
 const CONTACT_DEADLINE: Duration = Duration::from_secs(30);
+const CONTACT_DEADLINE_EXCEEDED: &str = "contact exceeded its authenticated-progress deadline";
 
 struct AuthenticatedContactProgress {
     generation: AtomicU64,
@@ -19349,14 +19350,24 @@ async fn run_node_actor_inner(
                         );
                     }
                     Some(Ok((task, (peer, Err(error))))) => {
-                        // With a gate the application says who is in reach, so the
-                        // Event edge this contact took stays due, whatever ended the
-                        // contact. The activity set below makes the retry wait the
-                        // news spacing. With no news the peer keeps the idle period.
+                        // With a gate the application says who is in reach, so a
+                        // contact that returns an error gives back the Event edge it
+                        // took, and the activity set below makes the retry wait the
+                        // news spacing. One that ran out its deadline doesn't: on a
+                        // link too slow for that page a retry fails the same way, and
+                        // the lower identity's retries would hold off the higher
+                        // identity's own contact. With no news the peer keeps the idle
+                        // period. A contact that yielded to a collision ends in the
+                        // arm below and gives nothing back.
                         if contact_gate.is_some() {
-                            if terminal_metadata
-                                .as_ref()
-                                .is_some_and(|metadata| metadata.launched_forced)
+                            let ran_out = matches!(
+                                &error,
+                                NodeError::Protocol(message) if message == CONTACT_DEADLINE_EXCEEDED
+                            );
+                            if !ran_out
+                                && terminal_metadata
+                                    .as_ref()
+                                    .is_some_and(|metadata| metadata.launched_forced)
                             {
                                 event_contact_wake.arm_event([peer.carrier()]);
                             }
@@ -19852,9 +19863,7 @@ async fn sync_once_with_forwarding(
     }
     with_authenticated_contact_progress_deadline(sync_session(endpoint, contact))
         .await
-        .map_err(|()| {
-            NodeError::Protocol("contact exceeded its authenticated-progress deadline".into())
-        })?
+        .map_err(|()| NodeError::Protocol(CONTACT_DEADLINE_EXCEEDED.into()))?
 }
 
 /// Connects on `address`, then on `fallback` if that fails. The fallback is the
@@ -39580,7 +39589,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn any_failure_with_a_gate_gives_back_the_news_and_waits_the_news_spacing() {
+    async fn a_failure_with_a_gate_gives_back_the_news_and_waits_the_news_spacing() {
         let pacing = ContactPacing {
             news: Duration::from_millis(200),
             idle: Duration::from_secs(60),
@@ -39592,7 +39601,6 @@ mod tests {
         assert!(node.launched(PacedActor::SOON).await);
         for error in [
             NodeError::Protocol("custody send finalization exceeded its age charge".into()),
-            NodeError::Protocol("contact exceeded its authenticated-progress deadline".into()),
             NodeError::CustodySendSkipped,
             NodeError::Store(StoreError::Custody(CustodyStoreError::ContinuityLost)),
         ] {
@@ -39610,6 +39618,33 @@ mod tests {
                 "a retry waits the news spacing"
             );
         }
+
+        node.fail_at_the_carrier();
+        node.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_contact_that_ran_out_its_deadline_spends_its_news() {
+        let pacing = ContactPacing {
+            news: Duration::from_millis(100),
+            idle: Duration::from_secs(60),
+        };
+        let gate = ContactGate::default();
+        let mut node = PacedActor::start("gated-deadline", pacing, Some(gate.clone())).await;
+        gate.set_reachable([node.peer]);
+
+        assert!(node.launched(PacedActor::SOON).await);
+        node.fail(NodeError::Protocol(CONTACT_DEADLINE_EXCEEDED.into()));
+        assert!(
+            !node.launched(pacing.news * 5).await,
+            "a retry would run out the same way"
+        );
+        node.publish().await;
+        assert!(
+            node.launched(PacedActor::SOON).await,
+            "new news goes at the news spacing"
+        );
 
         node.fail_at_the_carrier();
         node.stop().await;

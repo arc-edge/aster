@@ -35,10 +35,14 @@ Measured on one link between two nodes, with one 10-byte Event:
   out. On a shared radio with ten nodes that cost more than everything else. An
   application that knows who it can hear keeps this current, and outbound contacts
   go only to those peers. With a gate a contact that fails gives back the news it
-  took, whatever the failure, and doesn't mark the peer unreachable, so the retry waits
-  only the news spacing and news goes as soon as the peer returns. A contact that
-  carried no news leaves the peer on the idle period, so a link whose gate stays open
-  while contacts fail isn't retried at the news spacing.
+  took and doesn't mark the peer unreachable, so the retry waits only the news spacing
+  and news goes as soon as the peer returns. There is no back-off: a peer with news due
+  is retried at the news spacing until a contact succeeds or the gate closes, and each
+  retry costs at least a handshake. Only a peer with no news due stays on the idle
+  period. A contact that runs out its 30 s deadline doesn't give its news back. On a link
+  too slow for that page a retry fails the same way, and the lower identity's retries
+  hold off the higher identity's own contact, so the peer waits for the next publish or
+  the idle period. The cost is that a backlog too big for one contact moves on only then.
 - `MutableSourceInterests::event_only`. Contacts end after Event transfer and
   skip the State, Record, Blob and Event-bridge lanes, which cost round trips on
   every contact even with nothing to move.
