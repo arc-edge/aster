@@ -3948,6 +3948,7 @@ struct ContactActivityProbe {
     active: AtomicU64,
     completed: AtomicU64,
     failed: AtomicU64,
+    endpoint_closes: AtomicU64,
 }
 
 #[cfg(test)]
@@ -19524,7 +19525,18 @@ async fn run_node_actor_inner(
     drop(accepted_receiver);
     inbound.shutdown().await;
     outbound.shutdown().await;
-    endpoint.close().await;
+    // A connection accepted after the driver died is never counted down, so closing
+    // a stopped endpoint can wait forever. Dropping it aborts it.
+    if !matches!(
+        fatal_error,
+        Some(NodeError::Carrier(CarrierError::EndpointStopped))
+    ) {
+        #[cfg(test)]
+        contact_activity
+            .endpoint_closes
+            .fetch_add(1, Ordering::Relaxed);
+        endpoint.close().await;
+    }
     drop(endpoint);
     drop(application);
     drop(state_application);
@@ -34730,6 +34742,7 @@ mod tests {
         let (node, events, poll, captured, state) =
             accepting_node_with_subscription("stopped-endpoint").await;
         events.poll(poll.clone()).await.expect("poll while live");
+        let activity = node.contact_activity.clone();
 
         node.endpoint.close().await;
         let error = timeout(Duration::from_secs(10), async {
@@ -34754,6 +34767,7 @@ mod tests {
             matches!(stopped, NodeError::Carrier(CarrierError::EndpointStopped)),
             "{stopped:?}"
         );
+        assert_eq!(activity.endpoint_closes.load(Ordering::Relaxed), 0);
         assert!(
             !captured
                 .records()
@@ -34798,8 +34812,10 @@ mod tests {
         .expect("the actor sees the refused connection");
 
         events.poll(poll).await.expect("poll after a refused peer");
+        let activity = node.contact_activity.clone();
         let receipt = node.shutdown().await.expect("clean shutdown");
         assert!(receipt.contact_errors >= 1);
+        assert_eq!(activity.endpoint_closes.load(Ordering::Relaxed), 1);
         stranger.close().await;
         fs::remove_dir_all(state).expect("cleanup state");
     }

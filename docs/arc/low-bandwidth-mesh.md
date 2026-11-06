@@ -86,9 +86,10 @@ Measured on one link between two nodes, with one 10-byte Event:
   endpoint can stop for good, and accept then returns at once forever. The accept loop
   spun on that while application commands kept succeeding, so nothing restarted the
   service. A stopped endpoint now ends the node: commands fail, and
-  `RunningNode::shutdown` says why. Either network stopping does this, since a restart
-  rebinds both. A failed handshake from one peer stays an ordinary contact error. This
-  reaches every node, with no option to turn it off.
+  `RunningNode::shutdown` says why, without waiting to close the endpoint, which might
+  never finish. Either network stopping does this, since a restart rebinds both. A
+  failed handshake from one peer stays an ordinary contact error. This reaches every
+  node, with no option to turn it off.
 - Finite-TTL custody on macOS. `clock_gettime(3)` documents `CLOCK_MONOTONIC` as
   continuing through sleep, which is the property finite custody needs, and the
   custody clock already read it with `kern.boottime` as the boot domain. This reaches
