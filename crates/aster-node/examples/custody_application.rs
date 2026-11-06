@@ -82,7 +82,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     journal
         .recover(&mut numbered::Backend::Live(&events))
         .await?;
-    let (options, ttl_status) = if cfg!(target_os = "linux") {
+    let (options, ttl_status) = if cfg!(any(target_os = "linux", target_os = "macos")) {
         (
             EventPublishOptions::finite_ttl_ms(60_000)?,
             "finite_ttl_ms=60000",

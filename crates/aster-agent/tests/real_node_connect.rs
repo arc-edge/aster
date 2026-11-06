@@ -1834,7 +1834,7 @@ async fn platform_compat_optional_event_ttl_is_enforced_by_the_live_agent() {
         ErrorCode::InvalidArgument
     );
     request.tombstone = false;
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     assert_eq!(
         client
             .publish_numbered_event(request.clone())
@@ -1843,7 +1843,7 @@ async fn platform_compat_optional_event_ttl_is_enforced_by_the_live_agent() {
             .code,
         ErrorCode::PermissionDenied
     );
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         let subscription = client
             .create_event_subscription(api::CreateEventSubscriptionRequest {
@@ -2009,7 +2009,11 @@ async fn platform_compat_optional_event_ttl_is_enforced_by_the_live_agent() {
         // it is removed only when the client acknowledges that result.
         assert_eq!(operations.numbered_reverse_rows, 1);
     }
-    request.operation_sequence = if cfg!(target_os = "linux") { 2 } else { 1 };
+    request.operation_sequence = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        2
+    } else {
+        1
+    };
     request.ttl_ms = None;
     let durable = client
         .publish_numbered_event(request)

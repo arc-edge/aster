@@ -50,7 +50,7 @@ runs, omit the flag and retain the same state directory and journal. Recovery
 precedes publication; failed or uncertain work retains its full intent. A
 completed run advances the numbered sequence without adding a client identity.
 
-On Linux, the output reports `finite_ttl_ms=60000` and
+On Linux and macOS, the output reports `finite_ttl_ms=60000` and
 `authenticated_ttl_ms=Some(60000)`. On other platforms the example states the
 contract explicitly and uses a durable fallback:
 
@@ -140,11 +140,12 @@ source authenticated; forwarding cannot reset age or extend lifetime. Exact
 numbered replay returns the immutable receipt with content availability even
 after retirement, until application acknowledgement compacts that result.
 
-Finite custody is enabled only on Linux, where the selected runtime uses the
-suspend-inclusive boot clock. Other targets continue to support durable
-semantic-v3/v4/v5 custody, but finite publication fails closed until a suitable
-suspend-inclusive clock and restart contract are integrated. This is not a
-wall-clock timestamp protocol.
+Finite custody is enabled on Linux, where the selected runtime uses the
+suspend-inclusive boot clock, and on macOS, where `CLOCK_MONOTONIC` runs through
+sleep and `kern.boottime` identifies the boot. Other targets continue to support
+durable semantic-v3/v4/v5 custody, but finite publication fails closed until a
+suitable suspend-inclusive clock and restart contract are integrated. This is not
+a wall-clock timestamp protocol.
 
 ## Understand age and expiry
 

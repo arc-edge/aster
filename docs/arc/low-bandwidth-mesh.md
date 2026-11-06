@@ -3,8 +3,10 @@
 This fork of [Aster](https://github.com/defenseunicorns/aster) carries the
 changes [arc-uas](https://github.com/arc-edge/arc-uas) needs to run a small
 shared ledger between drones over a shared radio, satcom or metered cellular.
-Each one is opt-in, so a node that uses none of them behaves as upstream does.
-All nodes of a mission must set the same options.
+Each one is opt-in, so a node that uses none of them behaves as upstream does,
+except for two that reach every node: finite-TTL custody is on for any macOS node
+with a boot domain, and a node whose endpoint stops fails instead of spinning. All
+nodes of a mission must set the same options.
 
 Measured on one link between two nodes, with one 10-byte Event:
 
@@ -29,8 +31,10 @@ Measured on one link between two nodes, with one 10-byte Event:
   still spends airtime, because the handshake is sent and retried until it times
   out. On a shared radio with ten nodes that cost more than everything else. An
   application that knows who it can hear keeps this current, and outbound contacts
-  go only to those peers. With a gate a contact that fails at the carrier keeps its news
-  armed and doesn't mark the peer unreachable, so news goes as soon as the peer returns.
+  go only to those peers. With a gate a contact that fails at the carrier gives back
+  the news it took and doesn't mark the peer unreachable, so news goes as soon as the
+  peer returns. A contact that carried no news leaves the peer on the idle period, so
+  a link whose gate stays open while contacts fail isn't retried at the news spacing.
 - `MutableSourceInterests::event_only`. Contacts end after Event transfer and
   skip the State, Record, Blob and Event-bridge lanes, which cost round trips on
   every contact even with nothing to move.
@@ -40,6 +44,26 @@ Measured on one link between two nodes, with one 10-byte Event:
   on a slow link every retry aborted the same way, so the link never recovered.
   With this set, an Event with too little life left isn't scheduled. It stays in
   the difference as unscheduled, which the protocol already allows.
+
+  The same option decides what a receiver reconciles against. An Event that expires
+  leaves a fence that is never removed, and with every fence in the baseline the
+  sender and receiver sets stopped matching, so negentropy listed ids on every
+  range: a byte model gave 960 kB per contact in the second hour of a mission against
+  1.3 kB with no fences. No peer schedules an Event that close to expiry, so with this
+  set its fence stays out. A late offer of an accepted Event under Consume lands as a
+  duplicate. An offer that meets a route-only fence, or any fence under Carry, would
+  fail the contact, so those stay in. So do quota fences, because peers still hold
+  those Events. Every fence counts against a store's lifetime limit of 262,144 Events,
+  live rows included. Past it a node refuses new Events, and a contact carrying one
+  fails.
+
+  A reboot changes the custody clock, so a finite row loses its age for good and is
+  withheld until its lifetime ends. It sat in neither set, so every peer sent it again
+  on every contact, and a duplicate can't clear the loss. With this set such a row goes
+  in the baseline as a fence. With 100 of them a contact measured 9.7 kB rather than
+  1.1 MB, using inline credentials. A route-only row under Consume stays out, because
+  it still wants its content. A rebooted node's own sender set still lacks these rows,
+  so its lane to each peer lists about 33 bytes per row per contact until they expire.
 - `MissionCredentialTable`, through
   `UnprotectedReferenceMission::with_credential_table`. A source envelope and a
   handshake flight carry each member's credential and the authority's signature
@@ -56,9 +80,17 @@ Measured on one link between two nodes, with one 10-byte Event:
   exact addresses rather than a wildcard for the same reason.
 - `SelectedForwardingConfig::with_peer_fallbacks`. A second address for a
   configured peer, tried only after its own address fails to connect.
+- `CarrierError::EndpointStopped`. When a bound address leaves its interface the Iroh
+  endpoint can stop for good, and accept then returns at once forever. The accept loop
+  spun on that while application commands kept succeeding, so nothing restarted the
+  service. A stopped endpoint now ends the node: commands fail, and
+  `RunningNode::shutdown` says why. Either network stopping does this, since a restart
+  rebinds both. A failed handshake from one peer stays an ordinary contact error. This
+  reaches every node, with no option to turn it off.
 - Finite-TTL custody on macOS. `clock_gettime(3)` documents `CLOCK_MONOTONIC` as
   continuing through sleep, which is the property finite custody needs, and the
-  custody clock already read it with `kern.boottime` as the boot domain.
+  custody clock already read it with `kern.boottime` as the boot domain. This reaches
+  every macOS node where `kern.boottime` can be read, with no option to turn it off.
 
 ## Keeping up with upstream
 

@@ -771,7 +771,7 @@ const HELP: &str = "Aster selected-stack mesh CLI\n\n\
          retain only bounded route-verified bytes. The put command remains an isolated opaque\n\
          compatibility lane and is never advertised by Event reconciliation. Semantic v3 binds\n\
          finite-TTL dissemination to authenticated cumulative custody age, exact source claims,\n\
-         quotas, and final send checks; production finite-TTL clocks are currently Linux-only.\n\
+         quotas, and final send checks; production finite-TTL clocks are currently Linux and macOS.\n\
          Zeroize is an irreversible same-UID local operator hook. It durably locks the exact\n\
          state before destroying mission/carrier key contents through retained file descriptors\n\
          and preserves mesh data rows.\n\

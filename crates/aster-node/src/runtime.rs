@@ -2107,8 +2107,8 @@ impl NodeCustodyClock {
     /// Whether this reader may exercise finite custody semantics.
     ///
     /// Deterministic injected readers are test-only continuity authorities;
-    /// production readers require both the proven Linux clock source and a
-    /// validated kernel boot identity.
+    /// production readers require a clock that runs through suspend and a validated
+    /// boot identity, which Linux and macOS provide.
     pub(crate) fn supports_finite_ttl(&self) -> bool {
         self.finite_ttl_supported
             || cfg!(test) && {
