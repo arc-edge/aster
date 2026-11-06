@@ -64,8 +64,14 @@ Measured on one link between two nodes, with one 10-byte Event:
   on every contact, and a duplicate can't clear the loss. With this set such a row goes
   in the baseline as a fence. With 100 of them a contact measured 9.7 kB rather than
   1.1 MB, using inline credentials. A route-only row under Consume stays out, because
-  it still wants its content. A rebooted node's own sender set still lacks these rows,
-  so its lane to each peer lists about 33 bytes per row per contact until they expire.
+  it still wants its content.
+
+  The fences have a cost, because no sender can offer a row a node has lost. A rebooted
+  node's own sender set lacks these rows, so its lane to each peer lists them. A peer's
+  lane to it lists them too once the peer's copies are gone, and both lanes do when
+  both ends rebooted. That is about 35 bytes per row per lane on every contact, for up
+  to a TTL after boot, since the row's age counts only from there. One re-send costs
+  as much as about 110 contacts of this, so fencing still wins while peers hold rows.
 - `MissionCredentialTable`, through
   `UnprotectedReferenceMission::with_credential_table`. A source envelope and a
   handshake flight carry each member's credential and the authority's signature
