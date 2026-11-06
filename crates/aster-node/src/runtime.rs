@@ -19325,7 +19325,11 @@ async fn run_node_actor_inner(
                         );
                     }
                     Some(Ok((task, (peer, Err(error))))) => {
-                        if matches!(error, NodeError::Carrier(_)) {
+                        if matches!(
+                            error,
+                            NodeError::Carrier(_)
+                                | NodeError::Mission(MissionSessionError::Carrier(_))
+                        ) {
                             // With a gate the application says who is in reach, so the
                             // Event edge this contact took stays due for when the peer
                             // comes back. With no news the peer keeps the idle period.
@@ -39429,6 +39433,91 @@ mod tests {
             .expect("actor task")
             .expect("clean actor shutdown");
         fs::remove_dir_all(state).expect("cleanup actor state");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_contact_dropped_in_the_handshake_gives_back_its_news() {
+        let state = root("gated-handshake-failure");
+        fs::create_dir_all(&state).expect("actor state");
+        #[cfg(unix)]
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+            .expect("owner-only state root");
+        let local_id = NodeIdentity::load_or_create(&state)
+            .expect("local carrier identity")
+            .id();
+        let peer = Endpoint::bind(
+            aster_iroh::SecretKey::generate(),
+            EndpointConfig::direct("127.0.0.1:0".parse().expect("peer bind")),
+        )
+        .await
+        .expect("peer endpoint");
+        // This peer accepts QUIC and drops, so every contact dies in the handshake.
+        let (dropped, mut contacts) = mpsc::unbounded_channel();
+        let mut acceptor = peer.inbound_acceptor(&BTreeSet::from([local_id]));
+        let dropping = tokio::spawn(async move {
+            loop {
+                if let Ok(connection) = acceptor.accept().await {
+                    connection.close();
+                    let _ = dropped.send(());
+                }
+            }
+        });
+        let mut missions = issue_missions(2);
+        let peer_mission = missions.pop().expect("peer mission");
+        let local_mission = missions.pop().expect("local mission");
+        let gate = ContactGate::default();
+        gate.set_reachable([peer.id()]);
+        let node = start_node_with_forwarding(
+            NodeConfig {
+                state: state.clone(),
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                mission: local_mission.credentials,
+                peers: vec![MissionExpectedPeer {
+                    carrier: ExpectedPeer {
+                        id: peer.id(),
+                        address: peer.bound_sockets()[0],
+                    },
+                    mission: peer_mission.identity,
+                }],
+                mutable_interests: MutableSourceInterests::default(),
+                sync_interval: Duration::from_millis(20),
+                run_for: None,
+                application: NodeApplication::Relay,
+            },
+            SelectedForwardingConfig::default()
+                .with_contact_pacing(ContactPacing {
+                    news: Duration::from_millis(100),
+                    idle: Duration::from_secs(60),
+                })
+                .with_contact_gate(gate),
+        )
+        .await
+        .expect("start node");
+        node.selected_events()
+            .publish(EventPublishRequest {
+                operation_key: b"handshake-news".to_vec(),
+                predecessor: None,
+                topic: Topic::new("opaque").expect("topic"),
+                scope: Scope::new("test/runtime-contact").expect("scope"),
+                priority: Priority::Routine,
+                logical_key: b"news".to_vec(),
+                payload: b"news".to_vec(),
+                tombstone: false,
+            })
+            .await
+            .expect("publish");
+
+        for contact in ["the news starts one", "the failed one gave the news back"] {
+            timeout(Duration::from_secs(5), contacts.recv())
+                .await
+                .expect(contact)
+                .expect("peer still accepting");
+        }
+
+        node.shutdown().await.expect("clean shutdown");
+        dropping.abort();
+        peer.close().await;
+        fs::remove_dir_all(state).expect("cleanup state");
     }
 
     #[tokio::test]
