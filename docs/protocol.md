@@ -1484,7 +1484,7 @@ before offer, request, retry, send, or delivery while that monotonic clock
 remains continuous. Durable and tombstone rows instead retain the maximum
 received/authenticated age without charging idle local residence. Before every
 selected `LegacyV6` Event or RouteEvent send, the sender conservatively charges
-`32 + ceil(exact_sealed_event_bytes / 1024)` milliseconds for synchronous frame,
+`1000 + ceil(exact_sealed_event_bytes / 1024)` milliseconds for synchronous frame,
 AEAD, durable-store, and final-policy work. A finite transfer is withheld when
 that charged age reaches its TTL; the post-store carrier-adjacent sample must
 remain within the authenticated charge or the frame is abandoned before any

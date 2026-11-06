@@ -599,14 +599,17 @@ const DEMO_PING_OPERATION: &[u8] = b"aster.sample.ping-pong.v1/ping";
 const DEMO_EVENT_SUBSCRIPTION_KEY: &[u8] = b"aster.sample.ping-pong.v1/receive";
 const MAX_EVENT_PUBLISH_RETRIES: usize = 4;
 const MAX_CUSTODY_MAINTENANCE_RETRIES: usize = 4;
-const CUSTODY_FINALIZATION_FIXED_MS: u64 = 32;
+const CUSTODY_FINALIZATION_FIXED_MS: u64 = 1_000;
 const CUSTODY_FINALIZATION_BYTES_PER_MS: u64 = 1_024;
 /// Conservative authenticated age charged for the synchronous v3 send-finalization path.
 ///
 /// The bound budgets one millisecond per KiB of the maximum selected Event
-/// object plus 32 milliseconds for frame construction, both AEAD records,
-/// and the final durable lease/policy check. If real finalization exceeds this
-/// public charge, the sealed frame is abandoned before carrier I/O.
+/// object plus one second for frame construction, both AEAD records, and the
+/// final durable lease/policy check. The check is page-wide, so an Event page's
+/// first entry has to cover the preparation of the whole page, on hosts where a
+/// scheduler stall of tens of milliseconds is normal. If real finalization exceeds
+/// this public charge, the sealed frame is abandoned before carrier I/O. Each hop
+/// adds this to an Event's age, and an Event this close to its TTL isn't sent.
 pub const MAX_CUSTODY_FINALIZATION_CHARGE_MS: u64 = (MAX_OBJECT_BYTES as u64)
     .div_ceil(CUSTODY_FINALIZATION_BYTES_PER_MS)
     + CUSTODY_FINALIZATION_FIXED_MS;
@@ -1200,9 +1203,10 @@ impl MutableSourceInterests {
     /// before its page is written aborts the whole contact. On a slow link, a
     /// backlog after an outage always holds Events at the end of their lifetime,
     /// so every retry aborts the same way, and the link never recovers. Set this
-    /// above the longest a contact takes from its schedule to its last page. The
-    /// Events left out stay in the difference as unscheduled, which the protocol
-    /// already allows, and they would have expired anyway.
+    /// above the longest a contact takes from its schedule to its last page, plus
+    /// [`MAX_CUSTODY_FINALIZATION_CHARGE_MS`]. The Events left out stay in the
+    /// difference as unscheduled, which the protocol already allows, and they would
+    /// have expired anyway.
     ///
     /// Since no peer then schedules an Event at the end of its life, the fence an
     /// expired Event leaves also stays out of this node's reconciliation baseline,
@@ -36988,7 +36992,8 @@ mod tests {
     #[test]
     fn custody_finalization_charge_is_exact_length_bounded_and_ttl_strict() {
         let tiny_charge = custody_finalization_charge_ms(1).expect("tiny charge");
-        assert_eq!(tiny_charge, CUSTODY_FINALIZATION_FIXED_MS + 1);
+        assert_eq!(tiny_charge, 1_001);
+        assert_eq!(MAX_CUSTODY_FINALIZATION_CHARGE_MS, 2_024);
         assert_eq!(
             custody_finalization_charge_ms(MAX_OBJECT_BYTES as u64).expect("maximum charge"),
             MAX_CUSTODY_FINALIZATION_CHARGE_MS
@@ -37023,7 +37028,7 @@ mod tests {
             tick_ms: 1_017,
         };
         assert_eq!(
-            custody_age_at_sample(100, checkpoint, fresh, Some(151))
+            custody_age_at_sample(100, checkpoint, fresh, Some(1_119))
                 .expect("fresh same-clock sample"),
             (117, fresh)
         );
@@ -37041,7 +37046,7 @@ mod tests {
                     clock_id,
                     tick_ms: 999,
                 },
-                Some(151),
+                Some(1_119),
             )
             .expect("delayed same-clock sample"),
             (100, checkpoint),
@@ -37056,7 +37061,7 @@ mod tests {
                     clock_id: [0x56; 16],
                     tick_ms: 1_017,
                 },
-                Some(151),
+                Some(1_119),
             ),
             Err(NodeError::Store(StoreError::Custody(
                 CustodyStoreError::ContinuityLost
@@ -37070,15 +37075,15 @@ mod tests {
                     clock_id,
                     tick_ms: 1_001,
                 },
-                Some(151),
+                Some(1_119),
             )
             .is_err()
         );
 
-        let charged = charged_custody_finalization_age(117, 256, Some(151))
+        let charged = charged_custody_finalization_age(117, 256, Some(1_119))
             .expect("freshly observed age remains strictly before TTL after charge");
-        assert_eq!(charged, 150);
-        assert!(charged_custody_finalization_age(117, 256, Some(150)).is_err());
+        assert_eq!(charged, 1_118);
+        assert!(charged_custody_finalization_age(117, 256, Some(1_118)).is_err());
     }
 
     #[test]
@@ -54559,7 +54564,7 @@ mod tests {
                 assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
                     NativeProfile5LifecycleScenario {
                         preseed_equivalent_pack: true,
-                        ttl_ms: Some(if expire { 1_000 } else { 600_000 }),
+                        ttl_ms: Some(if expire { 2_000 } else { 600_000 }),
                         fail_after_receives: fail,
                         expire_before_promotion: expire,
                         revoke_before_promotion: revoke,
@@ -54617,7 +54622,7 @@ mod tests {
         run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
                 NativeProfile5LifecycleScenario {
-                    ttl_ms: Some(1_000),
+                    ttl_ms: Some(2_000),
                     expire_before_promotion: true,
                     source_clock_tick_ms: 100,
                     ..Default::default()
@@ -54659,7 +54664,9 @@ mod tests {
         run_native_profile5_test(Box::pin(
             assert_lifecycle_native_profile5_pack_crosses_without_legacy_repack(
                 NativeProfile5LifecycleScenario {
-                    ttl_ms: Some(80),
+                    // Charged for its 31 KiB, this source clears authorization. The
+                    // delay then carries its charged age, not its age, to the TTL.
+                    ttl_ms: Some(CUSTODY_FINALIZATION_FIXED_MS + 100),
                     sender_finalization_delay_ms: Some(60),
                     source_clock_tick_ms: 30,
                     fixture_override: Some(("sender-finalization-expiry", 0xeb)),
@@ -55425,11 +55432,17 @@ mod tests {
                 })
                 .await
                 .expect("rejected native sender finalization remains bounded");
-            let sent = sent.expect("join rejected native Profile-5 sender");
+            let sent = sent
+                .expect("join rejected native Profile-5 sender")
+                .expect_err("sender must reject stale finite custody")
+                .to_string();
             let (received, returned_target_verifier) =
                 received.expect("join rejected native Profile-5 receiver");
             target_verifier = returned_target_verifier;
-            assert!(sent.is_err(), "sender must reject stale finite custody");
+            assert!(
+                sent.starts_with("finalize finite native Profile-5 source"),
+                "the rejection must come at finalization: {sent}"
+            );
             assert!(
                 received.is_err(),
                 "receiver must observe the pre-emission sender rejection"
@@ -58479,7 +58492,7 @@ mod tests {
             BlobFinalizationKind::Overrun => {
                 ("overrun", 600_000, MAX_CUSTODY_FINALIZATION_CHARGE_MS + 1)
             }
-            BlobFinalizationKind::Expiry => ("expiry", 80, 30),
+            BlobFinalizationKind::Expiry => ("expiry", CUSTODY_FINALIZATION_FIXED_MS + 48, 30),
         };
         let source_is_server = direction.source_is_server();
         let services = control_test_services(if source_is_server {
@@ -62088,6 +62101,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn v7_event_page_survives_a_scheduler_stall_within_its_charge() {
+        let services = control_test_services([0x6f; 32]);
+        let receiver_state = root("v7-page-stall-receiver");
+        let source_state = root("v7-page-stall-source");
+        fs::create_dir_all(&receiver_state).expect("receiver state");
+        fs::create_dir_all(&source_state).expect("source state");
+        let receiver_store = Arc::new(
+            Store::open_for_mission(
+                receiver_state.join(STORE_FILE),
+                services.member.mission_authority_id(),
+            )
+            .expect("receiver store"),
+        );
+        let source_store = Arc::new(
+            Store::open_for_mission(
+                source_state.join(STORE_FILE),
+                services.other.mission_authority_id(),
+            )
+            .expect("source store"),
+        );
+        seed_test_event_subscription(
+            &receiver_store,
+            EventSubscriptionMode::Consume,
+            &services.topic,
+            &services.scope,
+            b"page-stall-consume",
+        );
+        let clock_id = [0x6b; 16];
+        let event = publish_test_custody_event(
+            &source_store,
+            &mut open_test_sealer(&services.other),
+            TestCustodyPublication {
+                operation: b"page-stall/event",
+                topic: &services.topic,
+                scope: &services.scope,
+                priority: Priority::Immediate,
+                ttl_ms: Some(10_000_000),
+                sample: CustodySample {
+                    clock_id,
+                    tick_ms: 0,
+                },
+                payload: b"stalled",
+                tombstone: false,
+            },
+        );
+
+        let (source, receiver) = contact_test_pair_with_forwarding_results(
+            TestForwardingNode {
+                store: receiver_store.clone(),
+                mission: services.member.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::ReceiveOnly)),
+                clock: NodeCustodyClock::injected([0x6a; 16], 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                preopen_custody_races: Vec::new(),
+            },
+            TestForwardingNode {
+                store: source_store.clone(),
+                mission: services.other.clone(),
+                policy: Arc::new(LiveEmissionPolicy::new(EventEmissionPolicy::Normal)),
+                clock: NodeCustodyClock::injected(clock_id, 0, 0),
+                reconciliation_exchanges_before_defer: None,
+                // Normal on a busy host, and well over the 32 ms upstream allows.
+                preopen_custody_races: vec![
+                    TestCustodyPreopenRace::EventPageFinalPostBatchDelayMs(200),
+                ],
+            },
+        )
+        .await;
+        let source = source.expect("a stall within the charge keeps the contact");
+        let receiver = receiver.expect("receiver contact");
+        assert_eq!(source.receipt.event_page_entries_sent, 1);
+        assert_eq!(receiver.receipt.event_page_inserts, 1);
+        assert!(
+            receiver_store
+                .get_event(event.transfer_id)
+                .expect("receiver Event lookup")
+                .is_some()
+        );
+        drop(receiver_store);
+        drop(source_store);
+        fs::remove_dir_all(receiver_state).expect("receiver cleanup");
+        fs::remove_dir_all(source_state).expect("source cleanup");
+    }
+
+    #[tokio::test]
     async fn v3_final_send_rechecks_policy_after_durable_authorization() {
         let services = control_test_services([0x79; 32]);
         let server_state = root("v3-final-send-policy-server");
@@ -62658,7 +62756,9 @@ mod tests {
                 clock: NodeCustodyClock::injected(source_clock_id, 0, 0),
                 reconciliation_exchanges_before_defer: None,
                 preopen_custody_races: vec![
-                    TestCustodyPreopenRace::EventPageSourcePreparationDelayMs(8),
+                    TestCustodyPreopenRace::EventPageSourcePreparationDelayMs(
+                        CUSTODY_FINALIZATION_FIXED_MS / 4,
+                    ),
                 ],
             },
             TestForwardingNode {
@@ -64221,7 +64321,7 @@ mod tests {
                 topic: &topic,
                 scope: &scope,
                 priority: Priority::Routine,
-                ttl_ms: Some(150),
+                ttl_ms: Some(1_150),
                 sample: CustodySample {
                     clock_id: source_clock_id,
                     tick_ms: 200,

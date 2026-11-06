@@ -4,9 +4,10 @@ This fork of [Aster](https://github.com/defenseunicorns/aster) carries the
 changes [arc-uas](https://github.com/arc-edge/arc-uas) needs to run a small
 shared ledger between drones over a shared radio, satcom or metered cellular.
 Each one is opt-in, so a node that uses none of them behaves as upstream does,
-except for two that reach every node: finite-TTL custody is on for any macOS node
-with a boot domain, and a node whose endpoint stops fails instead of spinning. All
-nodes of a mission must set the same options.
+except for three that reach every node: finite-TTL custody is on for any macOS node
+with a boot domain, a node whose endpoint stops fails instead of spinning, and a
+custody send charges a fixed second of age rather than 32 ms. All nodes of a mission
+must set the same options.
 
 Measured on one link between two nodes, with one 10-byte Event:
 
@@ -98,7 +99,8 @@ Measured on one link between two nodes, with one 10-byte Event:
   `RunningNode::shutdown` says why, without waiting to close the endpoint, which might
   never finish. Either network stopping does this. A restart fails until the main
   address is back, and comes up without an extra one that is gone, so a main address
-  leaving takes the extra network down with it until that address returns. A failed
+  leaving takes the extra network down with it until that address returns, though an
+  application can start the node with the other address as main until then. A failed
   handshake from one peer stays an ordinary contact error. This reaches every node,
   with no option to turn it off.
 - Finite-TTL custody on macOS. `clock_gettime(3)` documents `CLOCK_MONOTONIC` as
@@ -107,6 +109,16 @@ Measured on one link between two nodes, with one 10-byte Event:
   `kern.boottime` changes with the time zone and the wall clock, so a restart would
   read as a reboot. This reaches every macOS node where that sysctl can be read, with
   no option to turn it off.
+- The custody finalization charge. A custody send adds a fixed age to an Event for
+  the time sealing its frame takes, and aborts the whole contact if sealing took longer.
+  The check is page-wide, so the first entry's charge has to cover the whole page.
+  Upstream's 32 ms aborted contacts on a quiet machine in a 10-node emulation, and
+  can't survive normal scheduling on a Jetson or a busy laptop, so it is now one second.
+  Each hop adds about a second to an Event's age, which is small against a lifetime of
+  minutes, and no receiver limits what a hop adds. An Event with about a second or less
+  to live can't be sent, and one scheduled anyway aborts its contact, so keep
+  `with_min_send_remaining` above that. This reaches every node, with no option to turn
+  it off.
 
 ## Keeping up with upstream
 

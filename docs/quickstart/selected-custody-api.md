@@ -157,7 +157,7 @@ that wrapper before its atomic custody admission.
 - `age >= TTL` is expired. An expired Event is never advertised or sent.
 - For a finite row, known elapsed residence is accumulated; duplicates can only
   raise the durable age lower bound. Every v3 send also authenticates a conservative
-  `32 + ceil(exact sealed Event bytes / 1024)` millisecond finalization charge.
+  `1000 + ceil(exact sealed Event bytes / 1024)` millisecond finalization charge.
   A finite transfer is withheld if that charged age reaches TTL, and an actual
   overrun observed at the carrier-adjacent post-store sample abandons the frame
   before application bytes are written.
