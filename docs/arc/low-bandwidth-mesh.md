@@ -92,8 +92,10 @@ Measured on one link between two nodes, with one 10-byte Event:
   node, with no option to turn it off.
 - Finite-TTL custody on macOS. `clock_gettime(3)` documents `CLOCK_MONOTONIC` as
   continuing through sleep, which is the property finite custody needs, and the
-  custody clock already read it with `kern.boottime` as the boot domain. This reaches
-  every macOS node where `kern.boottime` can be read, with no option to turn it off.
+  custody clock already read it. `kern.bootsessionuuid` is the boot domain, because
+  `kern.boottime` changes with the time zone and the wall clock, so a restart would
+  read as a reboot. This reaches every macOS node where that sysctl can be read, with
+  no option to turn it off.
 
 ## Keeping up with upstream
 

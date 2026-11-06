@@ -2074,6 +2074,12 @@ impl Default for SelectedForwardingConfig {
     }
 }
 
+/// Names one boot on macOS. `kern.boottime` doesn't: its text ends in local time, and
+/// `CLOCK_MONOTONIC` reads as the wall clock minus it, so it has to move when the wall
+/// clock steps.
+#[cfg(target_os = "macos")]
+const MACOS_BOOT_SESSION_SYSCTL: &str = "kern.bootsessionuuid";
+
 /// Process-local reader for one OS monotonic-clock continuity domain.
 ///
 /// Linux derives the domain from a validated kernel boot UUID plus mission
@@ -2081,9 +2087,10 @@ impl Default for SelectedForwardingConfig {
 /// checkpoint domain. Linux uses the suspend-inclusive boot clock. A missing or
 /// malformed boot UUID falls back to process-local continuity and disables
 /// finite custody. macOS documents `CLOCK_MONOTONIC` as continuing through
-/// sleep, so it serves finite custody there with `kern.boottime` as the domain.
-/// Other Unix monotonic sources and the process-local non-Unix fallback have no
-/// proven suspend-inclusive contract; durable v3 scheduling remains portable.
+/// sleep, so it serves finite custody there with the boot session UUID as the
+/// domain. Other Unix monotonic sources and the process-local non-Unix fallback
+/// have no proven suspend-inclusive contract; durable v3 scheduling remains
+/// portable.
 #[derive(Clone, Debug)]
 pub(crate) struct NodeCustodyClock {
     clock_id: [u8; 16],
@@ -2107,7 +2114,7 @@ impl NodeCustodyClock {
     /// Whether this reader may exercise finite custody semantics.
     ///
     /// Deterministic injected readers are test-only continuity authorities;
-    /// production readers require a clock that runs through suspend and a validated
+    /// production readers require a clock that runs through suspend and a kernel
     /// boot identity, which Linux and macOS provide.
     pub(crate) fn supports_finite_ttl(&self) -> bool {
         self.finite_ttl_supported
@@ -2135,18 +2142,18 @@ impl NodeCustodyClock {
             #[cfg(target_os = "macos")]
             {
                 if let Ok(output) = Command::new("/usr/sbin/sysctl")
-                    .args(["-n", "kern.boottime"])
+                    .args(["-n", MACOS_BOOT_SESSION_SYSCTL])
                     .output()
                     && output.status.success()
                     && !output.stdout.is_empty()
                 {
-                    domain.extend_from_slice(b"macos-kern-boottime\0");
+                    domain.extend_from_slice(b"macos-boot-session\0");
                     domain.extend_from_slice(&output.stdout);
                 }
             }
             // macOS CLOCK_MONOTONIC keeps counting through sleep (clock_gettime(3)),
-            // and kern.boottime pins the domain to one boot, which is what finite
-            // custody needs. Other platforms have no such documented clock.
+            // and the boot session UUID pins the domain to one boot, which is what
+            // finite custody needs. Other platforms have no such documented clock.
             let finite_ttl_supported = cfg!(target_os = "macos") && !domain.is_empty();
             Self::from_domain(identity, domain, finite_ttl_supported)
         }
@@ -34957,6 +34964,22 @@ mod tests {
         let later = first.sample().expect("second monotonic sample");
         assert_eq!(earlier.clock_id, later.clock_id);
         assert!(later.tick_ms >= earlier.tick_ms);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_macos_boot_identity_ignores_the_time_zone() {
+        let read = |zone| {
+            Command::new("/usr/sbin/sysctl")
+                .args(["-n", MACOS_BOOT_SESSION_SYSCTL])
+                .env("TZ", zone)
+                .output()
+                .expect("read the boot identity")
+                .stdout
+        };
+        let identity = read("Asia/Tokyo");
+        assert!(!identity.is_empty());
+        assert_eq!(identity, read("America/Chicago"));
     }
 
     #[test]
