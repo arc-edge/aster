@@ -142,10 +142,10 @@ after retirement, until application acknowledgement compacts that result.
 
 Finite custody is enabled on Linux, where the selected runtime uses the
 suspend-inclusive boot clock, and on macOS, where `CLOCK_MONOTONIC` runs through
-sleep and `kern.bootsessionuuid` identifies the boot. Other targets continue to support
-durable semantic-v3/v4/v5 custody, but finite publication fails closed until a
-suitable suspend-inclusive clock and restart contract are integrated. This is not
-a wall-clock timestamp protocol.
+sleep and `kern.bootsessionuuid` identifies the boot. Other targets continue to
+support durable semantic-v3/v4/v5 custody, but finite publication fails closed
+until a suitable suspend-inclusive clock and restart contract are integrated.
+This is not a wall-clock timestamp protocol.
 
 ## Understand age and expiry
 

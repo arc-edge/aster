@@ -71,8 +71,9 @@ Measured on one link between two nodes, with one 10-byte Event:
   node's own sender set lacks these rows, so its lane to each peer lists them. A peer's
   lane to it lists them too once the peer's copies are gone, and both lanes do when
   both ends rebooted. That is about 35 bytes per row per lane on every contact, for up
-  to a TTL after boot, since the row's age counts only from there. One re-send costs
-  as much as about 110 contacts of this, so fencing still wins while peers hold rows.
+  to a TTL after boot, since time spent down doesn't count toward a row's age. One
+  re-send of a row costs as much as about 110 contacts of listing it, so fencing still
+  wins while peers hold rows.
 - `MissionCredentialTable`, through
   `UnprotectedReferenceMission::with_credential_table`. A source envelope and a
   handshake flight carry each member's credential and the authority's signature
