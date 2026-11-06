@@ -62430,7 +62430,7 @@ mod tests {
                 topic: &services.topic,
                 scope: &services.scope,
                 priority: Priority::Flash,
-                ttl_ms: Some(100),
+                ttl_ms: Some(CUSTODY_FINALIZATION_FIXED_MS + 100),
                 sample: CustodySample {
                     clock_id,
                     tick_ms: 0,
@@ -62547,7 +62547,7 @@ mod tests {
                         preopen_custody_races: vec![
                             TestCustodyPreopenRace::Expire {
                                 transfer_id: expired.transfer_id,
-                                tick_ms: 100,
+                                tick_ms: CUSTODY_FINALIZATION_FIXED_MS + 100,
                             },
                             TestCustodyPreopenRace::ItemChanged(changed.transfer_id),
                             TestCustodyPreopenRace::LeaseLimitExceeded(lease_limited.transfer_id),
