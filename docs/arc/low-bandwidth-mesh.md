@@ -28,6 +28,11 @@ Measured on one link between two nodes, with one 10-byte Event:
 - `ContactExpedite`, through `with_contact_expedite`. An application asks for the
   shorter `urgent` spacing when it publishes or receives something urgent. Asking on
   receipt is what speeds an Event up at every hop.
+- `ContactGate`, through `with_contact_gate`. A contact with a peer out of range
+  still spends airtime, because the handshake is sent and retried until it times
+  out. On a shared radio with ten nodes that cost more than everything else. An
+  application that knows who it can hear keeps this current, and outbound contacts
+  go only to those peers.
 - `MutableSourceInterests::event_only`. Contacts end after Event transfer and
   skip the State, Record, Blob and Event-bridge lanes, which cost round trips on
   every contact even with nothing to move.

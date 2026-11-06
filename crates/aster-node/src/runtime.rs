@@ -1681,6 +1681,7 @@ pub struct SelectedForwardingConfig {
     controlled_relay: Option<ControlledRelayRouting>,
     contact_pacing: Option<ContactPacing>,
     contact_expedite: Option<ContactExpedite>,
+    contact_gate: Option<ContactGate>,
     peer_fallbacks: BTreeMap<EndpointId, SocketAddr>,
     extra_bind: Option<ExtraBind>,
     #[cfg(feature = "nearby-discovery")]
@@ -1758,6 +1759,42 @@ impl PartialEq for ContactExpedite {
 
 impl Eq for ContactExpedite {}
 
+/// Tells a node which peers are worth contacting.
+///
+/// A contact with a peer out of range still spends airtime: the handshake is sent
+/// and retried until it times out. An application that already knows who it can hear
+/// keeps this current, and outbound contacts go only to those peers. A peer that
+/// comes into range is contacted as soon as its pacing allows, which for a peer gone
+/// a while is at once. Inbound contacts are unaffected.
+#[derive(Clone, Debug, Default)]
+pub struct ContactGate(Arc<StdRwLock<BTreeSet<EndpointId>>>);
+
+impl ContactGate {
+    /// Replaces the peers contacts may go to.
+    pub fn set_reachable(&self, peers: impl IntoIterator<Item = EndpointId>) {
+        let peers = peers.into_iter().collect();
+        *self
+            .0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = peers;
+    }
+
+    fn allows(&self, peer: &EndpointId) -> bool {
+        self.0
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(peer)
+    }
+}
+
+impl PartialEq for ContactGate {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ContactGate {}
+
 /// One explicitly selected, operator-controlled relay route.
 ///
 /// The relay is a carrier locator only. Exact carrier identity and the
@@ -1791,6 +1828,7 @@ impl SelectedForwardingConfig {
             controlled_relay: None,
             contact_pacing: None,
             contact_expedite: None,
+            contact_gate: None,
             peer_fallbacks: BTreeMap::new(),
             extra_bind: None,
             #[cfg(feature = "nearby-discovery")]
@@ -1811,6 +1849,12 @@ impl SelectedForwardingConfig {
     /// Connects `expedite`, which an application keeps a clone of, to this node.
     pub fn with_contact_expedite(mut self, expedite: ContactExpedite) -> Self {
         self.contact_expedite = Some(expedite);
+        self
+    }
+
+    /// Connects `gate`, which an application keeps a clone of, to this node.
+    pub fn with_contact_gate(mut self, gate: ContactGate) -> Self {
+        self.contact_gate = Some(gate);
         self
     }
 
@@ -17979,6 +18023,7 @@ async fn run_node_actor_inner(
     let non_preferred_fallback_delay = non_preferred_contact_fallback_delay(config.sync_interval);
     let contact_pacing = forwarding.contact_pacing;
     let contact_expedite = forwarding.contact_expedite.clone();
+    let contact_gate = forwarding.contact_gate.clone();
     let mut expedited_until = None::<Instant>;
     // Peers whose last outbound contact failed at the carrier. With pacing they
     // wait the idle period, so a node doesn't spend the link on a peer out of range.
@@ -18647,6 +18692,10 @@ async fn run_node_actor_inner(
                     let peer = contact_peers[(start + offset) % peer_count];
                     let peer_id = peer.carrier();
                     if !event_contact_wake.considers(peer_id, contact_cause) {
+                        continue;
+                    }
+                    // A peer out of reach keeps its armed Event edge too.
+                    if contact_gate.as_ref().is_some_and(|gate| !gate.allows(&peer_id)) {
                         continue;
                     }
                     // A deferred peer keeps its armed Event edge for a later tick.
@@ -34807,6 +34856,22 @@ mod tests {
         assert!(pacing.defers(false, false, true, tick, secs(29)));
         assert!(pacing.defers(false, true, true, tick, secs(29)));
         assert!(!pacing.defers(false, false, true, tick, secs(30)));
+    }
+
+    #[test]
+    fn a_contact_gate_allows_only_the_peers_set_and_its_clones_share_them() {
+        let (near, far) = (
+            aster_iroh::SecretKey::generate().public(),
+            aster_iroh::SecretKey::generate().public(),
+        );
+        let gate = ContactGate::default();
+        assert!(!gate.allows(&near));
+        gate.clone().set_reachable([near]);
+        assert!(gate.allows(&near));
+        assert!(!gate.allows(&far));
+        gate.set_reachable([far]);
+        assert!(!gate.allows(&near));
+        assert!(gate.allows(&far));
     }
 
     #[test]
