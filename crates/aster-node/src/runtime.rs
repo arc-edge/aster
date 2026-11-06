@@ -1703,9 +1703,10 @@ pub struct ContactPacing {
     /// may lack. The Event stays armed, so one contact carries all that arrived
     /// during the wait.
     pub news: Duration,
-    /// Time between contacts with no known news, and with a peer whose last
-    /// contact failed at the carrier. These repair anything a failed contact left
-    /// behind and find a peer back in range, so this bounds how long those last.
+    /// Time between contacts with no known news, and, with no gate, with a peer
+    /// whose last contact failed at the carrier. These repair anything a failed
+    /// contact left behind and find a peer back in range, so this bounds how long
+    /// those last.
     pub idle: Duration,
 }
 
@@ -16864,7 +16865,7 @@ enum ActorOutboundContactObservation {
 #[derive(Clone)]
 struct ActorOutboundContactTestHook {
     observations: mpsc::UnboundedSender<ActorOutboundContactObservation>,
-    results: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<NodeError>>>,
+    results: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Result<(), NodeError>>>>,
 }
 
 #[cfg(all(test, unix))]
@@ -16877,24 +16878,33 @@ impl ActorOutboundContactTestHook {
 
     async fn contact(
         &self,
-        peer: EndpointId,
+        peer: ContactPeer,
         previous_activity: Instant,
         launched_at: Instant,
+        store: &Store,
     ) -> Result<CompletedPeerContact, NodeError> {
         let _ = self
             .observations
             .send(ActorOutboundContactObservation::Launched {
-                peer,
+                peer: peer.carrier(),
                 previous_activity,
                 launched_at,
             });
-        Err(self
-            .results
+        self.results
             .lock()
             .await
             .recv()
             .await
-            .expect("actor outbound-contact test result channel remains open"))
+            .expect("actor outbound-contact test result channel remains open")?;
+        let policy = store.event_replication_policy_snapshot()?;
+        Ok(CompletedPeerContact {
+            receipt: PeerReceipt {
+                peer: Some(peer.carrier()),
+                mission_peer: peer.expected_mission(),
+                ..PeerReceipt::default()
+            },
+            event_policy: ContactEventPolicy::capture(&policy),
+        })
     }
 }
 
@@ -18781,7 +18791,8 @@ async fn run_node_actor_inner(
                             if let Some(hook) = outbound_contact_test_hook {
                                 return (
                                     peer,
-                                    hook.contact(peer_id, previous_activity, election_now).await,
+                                    hook.contact(peer, previous_activity, election_now, &store)
+                                        .await,
                                 );
                             }
                             (
@@ -19334,22 +19345,23 @@ async fn run_node_actor_inner(
                         );
                     }
                     Some(Ok((task, (peer, Err(error))))) => {
-                        if matches!(
-                            error,
-                            NodeError::Carrier(_)
-                                | NodeError::Mission(MissionSessionError::Carrier(_))
-                        ) {
-                            // With a gate the application says who is in reach, so the
-                            // Event edge this contact took stays due for when the peer
-                            // comes back. With no news the peer keeps the idle period.
-                            if contact_gate.is_none() {
-                                unreachable_peers.insert(peer.carrier());
-                            } else if terminal_metadata
+                        // With a gate the application says who is in reach, so the
+                        // Event edge this contact took stays due, whatever ended the
+                        // contact. The activity set below makes the retry wait the
+                        // news spacing. With no news the peer keeps the idle period.
+                        if contact_gate.is_some() {
+                            if terminal_metadata
                                 .as_ref()
                                 .is_some_and(|metadata| metadata.launched_forced)
                             {
                                 event_contact_wake.arm_event([peer.carrier()]);
                             }
+                        } else if matches!(
+                            error,
+                            NodeError::Carrier(_)
+                                | NodeError::Mission(MissionSessionError::Carrier(_))
+                        ) {
+                            unreachable_peers.insert(peer.carrier());
                         }
                         outbound_peers.remove(&peer.carrier());
                         outbound_abort_handles.remove(&peer.carrier());
@@ -39271,7 +39283,7 @@ mod tests {
         let released_at = Instant::now();
         assert!(released_at >= first_launch);
         contact_results_sender
-            .send(NodeError::EmissionPolicyChanged)
+            .send(Err(NodeError::EmissionPolicyChanged))
             .expect("release older-policy contact with exact terminal error");
         let second = timeout(Duration::from_secs(2), observations_receiver.recv())
             .await
@@ -39318,7 +39330,7 @@ mod tests {
         peer: EndpointId,
         state: PathBuf,
         launches: mpsc::UnboundedReceiver<ActorOutboundContactObservation>,
-        contact_results: mpsc::UnboundedSender<NodeError>,
+        contact_results: mpsc::UnboundedSender<Result<(), NodeError>>,
         application: mpsc::Sender<SelectedApplicationCommand>,
         _control: mpsc::Sender<SelectedControlCommand>,
         shutdown: mpsc::Sender<()>,
@@ -39427,15 +39439,21 @@ mod tests {
             }
         }
 
+        /// The next contact, as the activity it was paced from and when it started.
+        async fn next_launch(&mut self, within: Duration) -> Option<(Instant, Instant)> {
+            let observed = timeout(within, self.launches.recv()).await.ok()?;
+            match observed {
+                Some(ActorOutboundContactObservation::Launched {
+                    peer,
+                    previous_activity,
+                    launched_at,
+                }) if peer == self.peer => Some((previous_activity, launched_at)),
+                observed => panic!("expected a launch, got {observed:?}"),
+            }
+        }
+
         async fn launched(&mut self, within: Duration) -> bool {
-            let Ok(observed) = timeout(within, self.launches.recv()).await else {
-                return false;
-            };
-            assert!(matches!(
-                observed,
-                Some(ActorOutboundContactObservation::Launched { peer, .. }) if peer == self.peer
-            ));
-            true
+            self.next_launch(within).await.is_some()
         }
 
         fn fail_at_the_carrier(&self) {
@@ -39445,7 +39463,12 @@ mod tests {
         }
 
         fn fail(&self, error: NodeError) {
-            self.contact_results.send(error).expect("fail contact");
+            self.contact_results.send(Err(error)).expect("fail contact");
+        }
+
+        /// Ends a contact cleanly, which spends the news it took.
+        fn succeed(&self) {
+            self.contact_results.send(Ok(())).expect("end contact");
         }
 
         async fn publish(&self) {
@@ -39532,8 +39555,8 @@ mod tests {
             "the news that contact took stays due"
         );
 
-        // Any other failure spends it, and new news goes at the news spacing.
-        node.fail(NodeError::Protocol("injected failure".into()));
+        // A clean contact spends it, and new news goes at the news spacing.
+        node.succeed();
         assert!(!node.launched(pacing.news * 5).await);
         node.publish().await;
         assert!(
@@ -39552,6 +39575,43 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn any_failure_with_a_gate_gives_back_the_news_and_waits_the_news_spacing() {
+        let pacing = ContactPacing {
+            news: Duration::from_millis(200),
+            idle: Duration::from_secs(60),
+        };
+        let gate = ContactGate::default();
+        let mut node = PacedActor::start("gated-any-failure", pacing, Some(gate.clone())).await;
+        gate.set_reachable([node.peer]);
+
+        assert!(node.launched(PacedActor::SOON).await);
+        for error in [
+            NodeError::Protocol("custody send finalization exceeded its age charge".into()),
+            NodeError::Protocol("contact exceeded its authenticated-progress deadline".into()),
+            NodeError::CustodySendSkipped,
+            NodeError::Store(StoreError::Custody(CustodyStoreError::ContinuityLost)),
+        ] {
+            // Each contact outlasts the spacing, so only the failure can hold back a retry.
+            sleep(pacing.news * 2).await;
+            let failed_at = Instant::now();
+            node.fail(error);
+            let (paced_from, launched_at) = node
+                .next_launch(PacedActor::SOON)
+                .await
+                .expect("the news that contact took stays due");
+            assert!(paced_from >= failed_at, "a failure restarts the spacing");
+            assert!(
+                launched_at.duration_since(paced_from) >= pacing.news,
+                "a retry waits the news spacing"
+            );
+        }
+
+        node.fail_at_the_carrier();
+        node.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_failed_contact_with_a_gate_and_no_news_waits_the_idle_period() {
         let pacing = ContactPacing {
             news: Duration::from_millis(100),
@@ -39563,17 +39623,22 @@ mod tests {
 
         // This spends what a restart counts as news.
         assert!(node.launched(PacedActor::SOON).await);
-        node.fail(NodeError::Protocol("injected failure".into()));
+        node.succeed();
 
-        assert!(
-            node.launched(PacedActor::SOON).await,
-            "the idle period has passed"
-        );
-        node.fail_at_the_carrier();
-        assert!(
-            !node.launched(pacing.news * 5).await,
-            "a contact that carried no news is not retried at the news spacing"
-        );
+        for error in [
+            NodeError::Carrier(CarrierError::Transport("injected failure".into())),
+            NodeError::Protocol("injected failure".into()),
+        ] {
+            assert!(
+                node.launched(PacedActor::SOON).await,
+                "the idle period has passed"
+            );
+            node.fail(error);
+            assert!(
+                !node.launched(pacing.news * 5).await,
+                "a contact that carried no news is not retried at the news spacing"
+            );
+        }
 
         node.stop().await;
     }
@@ -39599,6 +39664,31 @@ mod tests {
             "and news doesn't change that"
         );
 
+        node.stop().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn only_a_carrier_failure_marks_a_peer_unreachable_without_a_gate() {
+        let pacing = ContactPacing {
+            news: Duration::from_millis(100),
+            idle: Duration::from_secs(60),
+        };
+        let mut node = PacedActor::start("ungated-protocol-failure", pacing, None).await;
+
+        assert!(node.launched(PacedActor::SOON).await);
+        node.fail(NodeError::Protocol("injected failure".into()));
+        assert!(
+            !node.launched(pacing.news * 5).await,
+            "with no gate a failed contact keeps no news"
+        );
+        node.publish().await;
+        assert!(
+            node.launched(PacedActor::SOON).await,
+            "new news goes at the news spacing"
+        );
+
+        node.fail_at_the_carrier();
         node.stop().await;
     }
 
