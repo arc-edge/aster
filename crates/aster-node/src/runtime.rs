@@ -18067,11 +18067,6 @@ async fn run_node_actor_inner(
                         }
                     }
                     Err(CarrierError::Timeout(_)) => {}
-                    // A stopped endpoint fails every later accept at once.
-                    Err(error @ CarrierError::EndpointStopped) => {
-                        let _ = accepted_sender.send(Err(error)).await;
-                        break;
-                    }
                     Err(error) => {
                         if accepted_sender.send(Err(error)).await.is_err() {
                             break;
