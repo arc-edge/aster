@@ -39589,10 +39589,14 @@ mod tests {
 
         assert!(node.launched(PacedActor::SOON).await);
         node.fail_at_the_carrier();
-        node.publish().await;
         assert!(
             !node.launched(pacing.news * 5).await,
             "with no gate a peer that failed may be out of range"
+        );
+        node.publish().await;
+        assert!(
+            !node.launched(pacing.news * 5).await,
+            "and news doesn't change that"
         );
 
         node.stop().await;
