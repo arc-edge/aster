@@ -106,17 +106,19 @@ Measured on one link between two nodes, with one 10-byte Event:
   exact addresses rather than a wildcard for the same reason.
 - `SelectedForwardingConfig::with_peer_fallbacks`. A second address for a
   configured peer, tried only after its own address fails to connect.
-- `CarrierError::EndpointStopped`. When a bound address leaves its interface the Iroh
-  endpoint can stop for good, and accept then returns at once forever. The accept loop
+- `CarrierError::EndpointStopped`. When the interface of a bound address goes down the
+  Iroh endpoint stops for good, and accept then returns at once forever. The accept loop
   spun on that while application commands kept succeeding, so nothing restarted the
-  service. A stopped endpoint now ends the node: commands fail, and
-  `RunningNode::shutdown` says why, without waiting to close the endpoint, which might
-  never finish. Either network stopping does this. A restart fails until the main
-  address is back, and comes up without an extra one that is gone, so a main address
-  leaving takes the extra network down with it until that address returns, though an
-  application can start the node with the other address as main until then. A failed
-  handshake from one peer stays an ordinary contact error. This reaches every node,
-  with no option to turn it off.
+  service. On real Linux interfaces in containers Iroh's rebind failed and the endpoint
+  stopped about 5 s after the interface went down. Deleting a bound address with its
+  interface still up didn't stop the endpoint, and the node carried on. A stopped
+  endpoint now ends the node: commands fail, and `RunningNode::shutdown` says why,
+  without waiting to close the endpoint, which might never finish. Either network
+  stopping does this. A restart fails until the main address is back, and comes up
+  without an extra one that is gone, so the main interface going down takes the extra
+  network down with it until it returns, though an application can start the node with
+  the other address as main until then. A failed handshake from one peer stays an
+  ordinary contact error. This reaches every node, with no option to turn it off.
 - Finite-TTL custody on macOS. `clock_gettime(3)` documents `CLOCK_MONOTONIC` as
   continuing through sleep, which is the property finite custody needs, and the
   custody clock already read it. `kern.bootsessionuuid` is the boot domain, because
