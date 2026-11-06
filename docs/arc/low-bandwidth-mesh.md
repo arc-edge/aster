@@ -24,12 +24,16 @@ Measured on one link between two nodes, with one 10-byte Event:
 - `SelectedForwardingConfig::with_contact_pacing`. A new Event starts a contact
   at once upstream, so a steady publisher pays a full contact per Event. Pacing
   batches news behind a minimum interval, and a link with no news stays quiet
-  for a longer one, as does a peer whose last contact failed. The higher identity
-  of a pair waits one tick more, so the two sides don't collide. Nothing records
-  which peers had news due, so a node starts as if all of them did, at the cost of one
-  contact per peer in reach after each restart. Pacing also turns off path MTU
-  discovery: its probes are the largest single cost of a connection this short, and
-  each contact is a new connection.
+  for a longer one, as does a peer whose last contact failed at the carrier when there
+  is no gate. The higher identity of a pair waits one tick more, so while their waits
+  end together the lower one goes first. After an outage both are past their waits and
+  launch at once, and a slow link can hold up the lower one's connection past the tick.
+  The higher identity then yields and its news goes in the inbound contact. If that
+  contact fails, the news waits for the next publish or the idle period. Nothing records
+  which peers had news due, so a node starts as if all of them did. A restart counts as
+  news, at the cost of one contact per peer in reach, and of retries if that contact
+  fails. Pacing also turns off path MTU discovery: its probes are the largest single
+  cost of a connection this short, and each contact is a new connection.
 - `ContactGate`, through `with_contact_gate`. A contact with a peer out of range
   still spends airtime, because the handshake is sent and retried until it times
   out. On a shared radio with ten nodes that cost more than everything else. An
@@ -46,6 +50,12 @@ Measured on one link between two nodes, with one 10-byte Event:
 - `MutableSourceInterests::event_only`. Contacts end after Event transfer and
   skip the State, Record, Blob and Event-bridge lanes, which cost round trips on
   every contact even with nothing to move.
+
+  That leaves a contact 30 s in all, because only Blob transfer counts as progress, and
+  a page of up to 16 finite Events lands whole. So a link has a floor. Measured with
+  300 ms each way, a backlog of 24 Events cleared at 8 kB/s and none of it landed at
+  6 kB/s, and at 2 kB/s a backlog of 2 landed and one of 6 didn't. Below about 8 kB/s a
+  backlog stays stuck until enough of it expires.
 - `MutableSourceInterests::with_min_send_remaining`. A contact's schedule is exact,
   so one Event that expires before its page is written aborts the whole contact.
   After an outage a backlog always holds Events at the end of their lifetime, and
